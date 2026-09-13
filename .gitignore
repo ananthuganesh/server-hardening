@@ -1,0 +1,12 @@
+# This repository is public. Private keys and secrets must never be committed.
+*.pem
+*.key
+*.ppk
+id_rsa*
+id_ecdsa*
+id_ed25519*
+.env
+.env.*
+
+# macOS
+.DS_Store

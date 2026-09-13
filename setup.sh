@@ -26,7 +26,11 @@ NC='\033[0m' # No Color
 # Global Variables
 TARGET_USER=""
 TARGET_HOME=""
-TARGET_PORT="2743"
+# SSH port is prompted in verify_environment; 2743 is only the suggested default.
+DEFAULT_SSH_PORT="2743"
+TARGET_PORT=""
+# Port sshd used before this run (read via sshd -T), to close its old UFW rule.
+PREVIOUS_SSH_PORT=""
 HOSTNAME_VAL=""
 LYNIS_TARGET_SCORE=83
 SSH_ROLLBACK_UNIT="ssh-hardening-rollback"
@@ -279,6 +283,44 @@ check_admin_ssh_keys() {
     log_success "SSH key(s) for '$TARGET_USER' found and permissions verified."
 }
 
+# Asked in Phase 2 because that is where the port is applied. On a rerun the
+# default is the port sshd already uses, so pressing Enter never moves SSH.
+prompt_ssh_port() {
+    local port_input
+    local default_port="$DEFAULT_SSH_PORT"
+    local listener
+
+    PREVIOUS_SSH_PORT="$(sshd -T 2>/dev/null | awk '$1 == "port" && !found {print $2; found = 1}' || true)"
+    if [[ "$PREVIOUS_SSH_PORT" =~ ^[0-9]+$ ]] && [ "$PREVIOUS_SSH_PORT" != "22" ]; then
+        default_port="$PREVIOUS_SSH_PORT"
+    fi
+
+    while true; do
+        read -r -p "SSH port, reachable only over Tailscale [$default_port]: " port_input
+        TARGET_PORT="${port_input:-$default_port}"
+
+        # 22 is excluded by the range on purpose: Tailscale SSH already answers on
+        # port 22 of the Tailscale IP, so sshd would be unreachable there.
+        if [[ ! "$TARGET_PORT" =~ ^[1-9][0-9]*$ ]] || [ "$TARGET_PORT" -lt 1024 ] || [ "$TARGET_PORT" -gt 65535 ]; then
+            log_error "Use a number from 1024 to 65535."
+            continue
+        fi
+        case "$TARGET_PORT" in
+            2019|6060|8080)
+                log_error "Port $TARGET_PORT is used by Caddy or CrowdSec on this server; choose another."
+                continue
+                ;;
+        esac
+        listener="$(ss -ltnpH "sport = :$TARGET_PORT" 2>/dev/null || true)"
+        if [ -n "$listener" ] && ! grep -q '"sshd"' <<< "$listener"; then
+            log_error "Port $TARGET_PORT is already used by another program; choose another."
+            continue
+        fi
+        break
+    done
+    log_info "SSH will listen on port $TARGET_PORT (Tailscale only)."
+}
+
 # Root gets locked in Phase 2, and provider emergency consoles log in with a
 # password, not a key. Without a usable admin password there is no way back in
 # if Tailscale or SSH ever breaks.
@@ -310,6 +352,7 @@ verify_environment() {
     resolve_target_user
     check_admin_ssh_keys
     ensure_admin_password
+    prompt_ssh_port
 
     # Hostname and timezone are set in bootstrap.sh (Phase 1); Phase 2 only reads them.
     HOSTNAME_VAL="$(hostname -s)"
@@ -327,19 +370,38 @@ verify_environment() {
     log_success "Execution context verified."
 }
 
+# Debian's locale-gen prints "done" even when localedef fails, which left
+# servers without en_US.UTF-8 and every shell warning "setlocale: cannot change
+# locale". Verify the locale exists and build it directly if it doesn't.
+ensure_en_us_locale() {
+    apt-get install -y locales
+    if grep -qE '^[#[:space:]]*en_US\.UTF-8[[:space:]]+UTF-8' /etc/locale.gen 2>/dev/null; then
+        sed -i 's/^[#[:space:]]*en_US\.UTF-8[[:space:]]\+UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+    else
+        echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+    fi
+    locale-gen
+
+    if ! grep -qiE '^en_US\.utf-?8$' <<< "$(locale -a 2>/dev/null || true)"; then
+        log_warning "locale-gen did not create en_US.UTF-8; building it directly with localedef..."
+        localedef -i en_US -f UTF-8 en_US.UTF-8 || true
+    fi
+
+    if grep -qiE '^en_US\.utf-?8$' <<< "$(locale -a 2>/dev/null || true)"; then
+        log_success "Locale en_US.UTF-8 is available."
+    else
+        log_warning "Locale en_US.UTF-8 is still missing; shells will warn 'setlocale: cannot change locale'."
+        log_warning "Check that /usr/share/i18n/locales/en_US exists (some cloud images strip locale sources)."
+    fi
+}
+
 # 2. Base System Setup
 configure_base_system() {
     printf "\n=== 1. Base System Setup ===\n"
 
     log_info "Configuring UTF-8 locale for terminal applications..."
     apt-get update
-    apt-get install -y locales
-    if grep -qE '^[#[:space:]]*en_US\.UTF-8[[:space:]]+UTF-8' /etc/locale.gen; then
-        sed -i 's/^[#[:space:]]*en_US\.UTF-8[[:space:]]\+UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
-    else
-        echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
-    fi
-    locale-gen en_US.UTF-8
+    ensure_en_us_locale
     update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
     cat << 'EOF' > /etc/default/locale
 LANG=en_US.UTF-8
@@ -858,7 +920,7 @@ EOF
     log_warning "1. Ensure your local computer is connected to Tailscale."
     log_warning "2. Open a NEW terminal window on your local machine."
     log_warning "3. Test the hardened connection by running:"
-    log_warning "   ssh -i ~/.ssh/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$ts_ip"
+    log_warning "   ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$ts_ip"
     log_warning "   (Use the .pem file bootstrap.sh generated. IdentitiesOnly=yes matters: MaxAuthTries is 3.)"
     log_warning "   Your SSH client sees the Tailscale IP and port as a new host, so it will ask you to confirm the fingerprint."
     log_warning "======================================================================"
@@ -908,12 +970,14 @@ configure_ufw_firewall() {
     ufw allow 443/tcp comment 'HTTPS'
     ufw allow 443/udp comment 'HTTP/3 (Caddy)'
     
-    # Open port 2743 specifically on the tailscale0 interface
+    # Open the SSH port only on the tailscale0 interface
     ufw allow in on tailscale0 to any port "$TARGET_PORT" proto tcp comment 'SSH via Tailscale only'
 
-    # Earlier versions of this script used port 2626; close it on reruns.
-    if [ "$TARGET_PORT" != "2626" ]; then
-        ufw delete allow in on tailscale0 to any port 2626 proto tcp >/dev/null 2>&1 || true
+    # If the SSH port changed since the last run, close the old one. A rollback
+    # restores it from the pre-run UFW snapshot.
+    if [[ "$PREVIOUS_SSH_PORT" =~ ^[0-9]+$ ]] && [ "$PREVIOUS_SSH_PORT" != "22" ] && [ "$PREVIOUS_SSH_PORT" != "$TARGET_PORT" ]; then
+        log_info "Closing the previous SSH port $PREVIOUS_SSH_PORT in UFW..."
+        ufw delete allow in on tailscale0 to any port "$PREVIOUS_SSH_PORT" proto tcp >/dev/null 2>&1 || true
     fi
 
     log_info "Enabling UFW..."
@@ -1398,10 +1462,10 @@ EOF
     fi
     
     log_info "Hardening login definitions in /etc/login.defs..."
-    sed -i 's/^UMASK.*/UMASK 027/' /etc/login.defs
-    
-    # Append high rounds and passwords durations if not already present
-    for entry in "SHA_CRYPT_MIN_ROUNDS 10000" "SHA_CRYPT_MAX_ROUNDS 65536" "PASS_MAX_DAYS 365" "PASS_MIN_DAYS 1" "PASS_WARN_AGE 14"; do
+
+    # Set or append each value. Debian 13's login.defs has no UMASK line, so a
+    # replace-only sed would silently leave the umask unset.
+    for entry in "UMASK 027" "SHA_CRYPT_MIN_ROUNDS 10000" "SHA_CRYPT_MAX_ROUNDS 65536" "PASS_MAX_DAYS 365" "PASS_MIN_DAYS 1" "PASS_WARN_AGE 14"; do
         key=$(echo "$entry" | cut -d' ' -f1)
         if grep -q "^$key" /etc/login.defs; then
             sed -i "s|^$key.*|$entry|" /etc/login.defs
@@ -2041,7 +2105,7 @@ run_lynis_audit() {
         local reboot_ts_ip
         reboot_ts_ip=$(tailscale ip -4 2>/dev/null | tr -d '[:space:]' || true)
         if [ -n "$reboot_ts_ip" ]; then
-            log_warning "A reboot is required to finish applying kernel/service updates. Reconnect after reboot with: ssh -i ~/.ssh/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$reboot_ts_ip"
+            log_warning "A reboot is required to finish applying kernel/service updates. Reconnect after reboot with: ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$reboot_ts_ip"
         else
             log_warning "A reboot is required to finish applying kernel/service updates."
         fi
@@ -2075,7 +2139,7 @@ main() {
     log_success "All security policies, firewalls, and application nodes are active!"
     log_info "Operating system: $OS_PRETTY"
     log_info "Summary of active endpoints:"
-    printf " - SSH Administrative Access:  ${CYAN}ssh -i ~/.ssh/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$ts_ip${NC}\n"
+    printf " - SSH Administrative Access:  ${CYAN}ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$ts_ip${NC}\n"
     printf " - HTTP Public Interface:      ${CYAN}Port 80 (Open)${NC}\n"
     printf " - HTTPS Public Interface:     ${CYAN}Port 443 TCP + UDP/HTTP3 (Open)${NC}\n"
     printf " - Web server (Caddy) sites:   ${CYAN}/etc/caddy/sites/*.caddy${NC}\n"

@@ -46,7 +46,7 @@ Internet
    ├─ UFW Firewall               ← Layer 2: OS level (automatically configured)
    │   ├─ default deny incoming
    │   ├─ allow 80/tcp, 443/tcp, 443/udp (HTTP/3)
-   │   └─ allow 2743 on tailscale0 interface only
+   │   └─ allow SSH_PORT (default 2743) on tailscale0 only
    │
    ├─ CrowdSec IPS               ← Layer 3: threat intelligence (installed & tuned)
    │   ├─ OpenSSH Trixie custom sshd-session parser, Caddy access log
@@ -63,7 +63,7 @@ Internet
        └─ DOCKER-USER rules stop published ports bypassing UFW
 
 Tailscale VPN (100.x.x.x)
-   ├─ SSH :2743      → admin access (selected admin user, key only, modern ciphers)
+   ├─ SSH :SSH_PORT  → admin access (selected admin user, key only, modern ciphers)
    └─ Tailscale SSH :22 → emergency path, non-root users only (tailnet policy)
 
 Nightly 03:30 → automatic updates (Debian + Tailscale, Docker, CrowdSec, Caddy)
@@ -83,11 +83,12 @@ To run the semi-automated hardening cycle, use the provided scripts (`bootstrap.
 
 > The emergency console logs in with a password, not an SSH key. Phase 1 sets a password for the admin user, and Phase 2 refuses to continue until that user has one, because Phase 2 locks root. Save the password in your password manager: `sudo` needs it too.
 
-### Step B: Upload Scripts to the Target Server
-From your **local machine (MacBook)**:
+### Step B: Get the Scripts onto the Server
+Either upload them from your **local machine (MacBook)**:
 ```bash
 scp bootstrap.sh setup.sh root@YOUR_SERVER_PUBLIC_IP:/root/
 ```
+or clone this repository on the server and run the scripts from the clone.
 
 ### Step C: Execute Phase 1 — Environment Bootstrapping (Run as `root`)
 SSH into your server as root via public IP and execute:
@@ -98,31 +99,32 @@ chmod +x bootstrap.sh setup.sh
 Some providers disable root SSH login and give you a default sudo user instead (for example `admin` or `debian`). In that case upload the scripts to that user's home and run `sudo ./bootstrap.sh`.
 
 * **Interactive Prompts**: Phase 1 is the only place you enter the hostname and username; Phase 2 reuses them. The script asks for:
-  No names are hardcoded; timezone is the only prompt with a fixed default:
+  No names are hardcoded:
   * **Server hostname**: press Enter to keep the current one. It is applied first, so the generated .pem file and the later setup already use it. If cloud-init is present, the script writes `/etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg` so the provider doesn't reset the hostname or `/etc/hosts` on reboot.
-  * **Timezone**: default `Asia/Kolkata`; press Enter to use it, or type another name such as `Europe/Berlin`. The name is validated against `timedatectl list-timezones`. The nightly update window (03:30) uses this timezone.
+  * **Timezone**: not prompted. Always set to `Asia/Kolkata`, and the nightly update window (03:30) uses it.
   * **Administrative username**: required, with no default. Existing system accounts with a UID below 1000 are refused.
   * **Password** of at least 14 characters, matching the password policy Phase 2 installs.
   * **SSH login key**: no prompt. Login always uses an **Ed25519 .pem key generated on the server** (OpenSSH format, works with `ssh` on macOS, Linux and Windows 10+). You can't paste your own public key or choose another key type. The private key is saved as `ADMIN-HOSTNAME.pem` in the home directory of the account running the script: `/root` when run as root, or the default sudo user's home when run with `sudo`.
-* **Downloading the .pem key**: The final instructions print the exact commands. From your computer (replace `root` and `/root` with the default user and its home if you ran with `sudo`):
+* **Downloading the .pem key**: the server can't push files to your computer, so the end of Phase 1 prints the download commands. They save into `~/keys/`. Run them **on your computer**. Set `-i` to the key you logged in with (for example your cloud provider's key pair), and replace `root` and `/root` with the default user and its home if you ran with `sudo`:
   ```bash
-  scp root@YOUR_SERVER_PUBLIC_IP:/root/YOUR_ADMIN_USER-HOSTNAME.pem ~/.ssh/
-  chmod 600 ~/.ssh/YOUR_ADMIN_USER-HOSTNAME.pem
-  ssh -i ~/.ssh/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes YOUR_ADMIN_USER@YOUR_SERVER_PUBLIC_IP
+  mkdir -p ~/keys
+  scp -i ~/keys/YOUR_CURRENT_LOGIN_KEY.pem root@YOUR_SERVER_PUBLIC_IP:/root/YOUR_ADMIN_USER-HOSTNAME.pem ~/keys/
+  chmod 600 ~/keys/YOUR_ADMIN_USER-HOSTNAME.pem
+  ssh -i ~/keys/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes YOUR_ADMIN_USER@YOUR_SERVER_PUBLIC_IP
   ```
-  The script then waits: type `show` to print the key in the terminal (useful from a web console), `delete` to shred the server copy once login works, or `keep`. The key is generated without a passphrase; add one locally with `ssh-keygen -p -f ~/.ssh/YOUR_ADMIN_USER-HOSTNAME.pem`.
+  The script then waits: type `show` to print the key in the terminal (useful from a web console), `delete` to shred the server copy once login works, or `keep`. The key is generated without a passphrase; add one locally with `ssh-keygen -p -f ~/keys/YOUR_ADMIN_USER-HOSTNAME.pem`.
 * **Reconfiguring a key later**: the previous `authorized_keys` is saved as `authorized_keys.bak.TIMESTAMP` first.
-  * If the server is already hardened, the printed commands use the Tailscale IP and port 2743.
+  * If the server is already hardened, the printed commands use the Tailscale IP and your SSH port.
   * If you regenerate the .pem key for the account you are logged in as, `scp` can't work, because it would need the new key. Use `show` to copy the key, and don't type `delete` until a new login succeeds.
 * **Keep the root session open** until you confirm that the new `YOUR_ADMIN_USER` SSH login works from another terminal.
 * **Rerun behavior**: If the admin user already exists and you choose not to reconfigure the password/key, Phase 1 still refreshes `setup.sh` in that user's home directory.
 * **Adding a second admin to a hardened server**: sshd only admits the users in `AllowUsers`, so Phase 1 offers to add the new user there (validated with `sshd -t` and restored on failure). When that user later runs `sudo ./setup.sh`, the existing admins stay in `AllowUsers`; nobody is removed.
-* **Public IP output**: At the end, `bootstrap.sh` asks public IP lookup services (`api.ipify.org`, then `ifconfig.me`), falls back to local route detection, and prints the real `ssh -i ~/.ssh/YOUR_ADMIN_USER-HOSTNAME.pem ... YOUR_ADMIN_USER@SERVER_PUBLIC_IP` command when detection succeeds. On providers that use NAT, the local-route fallback shows a private IP; use the public IP from your provider's dashboard instead.
+* **Public IP output**: At the end, `bootstrap.sh` asks public IP lookup services (`api.ipify.org`, then `ifconfig.me`), falls back to local route detection, and prints the real `ssh -i ~/keys/YOUR_ADMIN_USER-HOSTNAME.pem ... YOUR_ADMIN_USER@SERVER_PUBLIC_IP` command when detection succeeds. On providers that use NAT, the local-route fallback shows a private IP; use the public IP from your provider's dashboard instead.
 
 ### Step D: Execute Phase 2 — System Hardening (Run as `YOUR_ADMIN_USER`)
 Open a **new terminal** on your local machine and connect as the newly created admin user:
 ```bash
-ssh -i ~/.ssh/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes YOUR_ADMIN_USER@YOUR_SERVER_PUBLIC_IP
+ssh -i ~/keys/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes YOUR_ADMIN_USER@YOUR_SERVER_PUBLIC_IP
 ```
 Execute the main configuration and security hardening suite with `sudo` from your home directory (where `bootstrap.sh` automatically copied it with correct permissions):
 ```bash
@@ -131,7 +133,14 @@ sudo ./setup.sh
 ```
 
 #### 💡 Safe Interactive Checkpoints in Phase 2:
-Phase 2 doesn't ask for the username, hostname or timezone again. It uses the account that ran `sudo ./setup.sh` as the admin user, and the hostname and timezone set in Phase 1. It only asks for a username if it can't detect one, for example when started from a root shell.
+Phase 2 doesn't ask for the username or hostname again. It uses the account that ran `sudo ./setup.sh` as the admin user, and the hostname and timezone set in Phase 1. It only asks for a username if it can't detect one, for example when started from a root shell.
+
+**SSH port prompt**: Phase 2 asks which port SSH should use, reachable only over Tailscale.
+* **Default:** `2743`. On a rerun, the default is the port SSH already uses, so pressing Enter never moves SSH.
+* **Allowed:** 1024–65535. It refuses a port another program already uses, and the ports Caddy (2019) and CrowdSec (6060, 8080) use. Port 22 is excluded on purpose, because Tailscale SSH already answers on port 22 of the Tailscale IP.
+* **Changing the port on a rerun** closes the old port's UFW rule. A rollback brings the old port back.
+
+In the commands below, `SSH_PORT` means the port you chose.
 
 **Pre-flight lockout checks** (before anything changes):
 * The admin user must have a valid key in `~/.ssh/authorized_keys`, or Phase 2 stops. It also fixes permissions on the home directory, `~/.ssh` and `authorized_keys`, because with `StrictModes` sshd silently ignores keys when those are writable by other users.
@@ -140,9 +149,9 @@ Phase 2 doesn't ask for the username, hostname or timezone again. It uses the ac
 1. **Tailscale login**: The script runs `tailscale up --ssh --accept-dns=true --accept-routes=false`, prints a unique Tailscale login URL, and waits up to 2 minutes for activation. If Tailscale fails or times out, the script stops before touching SSH.
    * **Key expiry check**: Tailscale node keys expire after 180 days by default. When that happens, the server leaves the tailnet and SSH is gone. If expiry is enabled, the script stops and asks you to disable it: **Tailscale admin console → Machines → server → ⋯ → Disable key expiry**.
    * `--accept-routes=false`: if another tailnet device advertises a subnet route that overlaps this server's own network (for example a 10.x private or VPC range), accepting it would pull local traffic into Tailscale and cut the server off.
-2. **UFW & SSH Verification Gate**: The script arms a 10-minute automatic rollback, moves SSH to port `2743`, restricts that port to the Tailscale interface in UFW, and pauses.
+2. **UFW & SSH Verification Gate**: The script arms a 10-minute automatic rollback, moves SSH to the port you chose (see **SSH port** below), restricts that port to the Tailscale interface in UFW, and pauses.
    * **Keep your current terminal open.**
-   * Open a **NEW local terminal** on your MacBook and run: `ssh -i ~/.ssh/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes -p 2743 YOUR_ADMIN_USER@YOUR_TAILSCALE_IP`.
+   * Open a **NEW local terminal** on your MacBook and run: `ssh -i ~/keys/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes -p SSH_PORT YOUR_ADMIN_USER@YOUR_TAILSCALE_IP`.
    * `MaxAuthTries` is 3. If your SSH agent (1Password, Secretive, `ssh-add`) holds several keys, ssh tries them all and the server refuses the login before reaching the right one. Always pass `-i` together with `-o IdentitiesOnly=yes`.
    * If it connects, enter **`yes`** to cancel the rollback timer, complete setup, and lock down root. If you answer after the 10-minute window, the rollback has already run. The script detects this and stops instead of pretending the server is hardened.
    * If it fails, enter **`no`**. The script restores your previous SSH config and disables UFW entirely to ensure you are not locked out.
@@ -176,7 +185,7 @@ source ~/.bashrc
 ```
 Configure timedate metrics, log forwarding, and upgrade the OS:
 ```bash
-sudo timedatectl set-timezone Asia/Kolkata    # automated in bootstrap.sh (prompted, default Asia/Kolkata)
+sudo timedatectl set-timezone Asia/Kolkata    # automated in bootstrap.sh (fixed, not prompted)
 sudo hostnamectl set-hostname YOUR_HOSTNAME   # automated in bootstrap.sh (prompted)
 sudo sed -i "s|^127\.0\.1\.1.*|127.0.1.1 YOUR_HOSTNAME|" /etc/hosts
 # On cloud-init images, keep the provider from resetting it at boot:
@@ -265,7 +274,7 @@ Emergency login: `ssh YOUR_ADMIN_USER@YOUR_TAILSCALE_IP` (port 22, no key needed
 ### Step 4: SSH Hardening
 Edit `/etc/ssh/sshd_config`:
 ```ini
-Port 2743
+Port SSH_PORT
 
 HostKey /etc/ssh/ssh_host_ed25519_key
 HostKey /etc/ssh/ssh_host_rsa_key
@@ -343,7 +352,7 @@ sudo ufw allow 443/tcp comment 'HTTPS'
 sudo ufw allow 443/udp comment 'HTTP/3 (Caddy)'
 
 # Allow SSH only on Tailscale
-sudo ufw allow in on tailscale0 to any port 2743 proto tcp comment 'SSH via Tailscale only'
+sudo ufw allow in on tailscale0 to any port SSH_PORT proto tcp comment 'SSH via Tailscale only'
 sudo ufw enable
 ```
 
@@ -352,7 +361,7 @@ Most providers offer a network firewall in front of the server (called a firewal
 * **Inbound HTTP**: TCP `80` from `0.0.0.0/0` and `::/0`
 * **Inbound HTTPS**: TCP `443` and UDP `443` (HTTP/3) from `0.0.0.0/0` and `::/0`
 * **Inbound Tailscale (optional)**: UDP `41641` from `0.0.0.0/0` and `::/0`. This allows direct peer connections; without it Tailscale still works through relays, just slower.
-* **No SSH rule.** SSH traffic travels inside the encrypted Tailscale tunnel, so the provider firewall never sees TCP 2743. Don't open 22 or 2743 publicly.
+* **No SSH rule.** SSH traffic travels inside the encrypted Tailscale tunnel, so the provider firewall never sees the SSH port. Don't open 22 or your SSH port publicly.
 * **Outbound**: Allow all outbound traffic. Tailscale and CrowdSec need it, and so do apt and Docker.
 
 Apply this firewall only after Phase 2 succeeds and you have tested a reboot. If your provider has no network firewall, UFW (Step 5) still enforces the same policy on the server.
@@ -616,7 +625,7 @@ sudo reboot
 
 Reconnect through Tailscale after the server returns:
 ```bash
-ssh -i ~/.ssh/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes -p 2743 YOUR_ADMIN_USER@YOUR_TAILSCALE_IP
+ssh -i ~/keys/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes -p SSH_PORT YOUR_ADMIN_USER@YOUR_TAILSCALE_IP
 ```
 
 Verify the new kernel and health status:
@@ -633,7 +642,7 @@ sudo systemctl restart ssh
 sudo systemctl restart tailscaled
 ```
 
-Then reconnect with `ssh -i ~/.ssh/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes -p 2743 YOUR_ADMIN_USER@YOUR_TAILSCALE_IP`.
+Then reconnect with `ssh -i ~/keys/YOUR_ADMIN_USER-HOSTNAME.pem -o IdentitiesOnly=yes -p SSH_PORT YOUR_ADMIN_USER@YOUR_TAILSCALE_IP`.
 
 ### 🔐 GitHub Deploy Keys (one per project)
 GitHub lets you add a deploy key to **one repository only**, so every project deployed on the server needs its own key. Run the helper as the admin user (not with `sudo`) when you deploy a project:

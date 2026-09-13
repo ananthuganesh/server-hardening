@@ -25,8 +25,7 @@ NC='\033[0m' # No Color
 
 TARGET_USER=""
 HOSTNAME_VAL=""
-TIMEZONE_VAL=""
-DEFAULT_TIMEZONE="Asia/Kolkata"
+TIMEZONE_VAL="Asia/Kolkata"
 SSH_PORT="22"
 SSH_ACCESS_IP=""
 RECONFIGURE_USER="yes"
@@ -34,6 +33,9 @@ PASS1=""
 SSH_KEY=""
 PEM_FILE=""
 PEM_OWNER="root"
+# Folder on the admin's own computer where the printed commands save the .pem.
+# Shown literally in instructions, so "~" stays unexpanded on purpose.
+LOCAL_KEY_DIR="~/keys"
 SERVER_PUBLIC_IP="YOUR_SERVER_PUBLIC_IP"
 OS_ID=""
 OS_VERSION_ID=""
@@ -135,24 +137,32 @@ prompt_hostname() {
     done
 }
 
-prompt_timezone() {
-    local timezone_input
-    local current_timezone
-    local valid_timezones
+# Debian's locale-gen prints "done" even when localedef fails, which left
+# servers without en_US.UTF-8 and every shell warning "setlocale: cannot change
+# locale". Verify the locale exists and build it directly if it doesn't.
+ensure_en_us_locale() {
+    apt-get install -y locales
+    if grep -qE '^[#[:space:]]*en_US\.UTF-8[[:space:]]+UTF-8' /etc/locale.gen 2>/dev/null; then
+        sed -i 's/^[#[:space:]]*en_US\.UTF-8[[:space:]]\+UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+    else
+        echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+    fi
+    locale-gen
 
-    current_timezone="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
-    current_timezone="${current_timezone:-UTC}"
-    valid_timezones="$(timedatectl list-timezones 2>/dev/null || true)"
-    while true; do
-        read -r -p "Enter timezone [$DEFAULT_TIMEZONE] (current: $current_timezone): " timezone_input
-        TIMEZONE_VAL="${timezone_input:-$DEFAULT_TIMEZONE}"
-        if [ -z "$valid_timezones" ] || grep -qxF "$TIMEZONE_VAL" <<< "$valid_timezones"; then
-            break
-        fi
-        log_error "Unknown timezone '$TIMEZONE_VAL'. List valid names with: timedatectl list-timezones"
-    done
+    if ! grep -qiE '^en_US\.utf-?8$' <<< "$(locale -a 2>/dev/null || true)"; then
+        log_warning "locale-gen did not create en_US.UTF-8; building it directly with localedef..."
+        localedef -i en_US -f UTF-8 en_US.UTF-8 || true
+    fi
+
+    if grep -qiE '^en_US\.utf-?8$' <<< "$(locale -a 2>/dev/null || true)"; then
+        log_success "Locale en_US.UTF-8 is available."
+    else
+        log_warning "Locale en_US.UTF-8 is still missing; shells will warn 'setlocale: cannot change locale'."
+        log_warning "Check that /usr/share/i18n/locales/en_US exists (some cloud images strip locale sources)."
+    fi
 }
 
+# The timezone is fixed (not prompted); the nightly update window uses it.
 apply_timezone() {
     log_info "Setting timezone to $TIMEZONE_VAL..."
     timedatectl set-timezone "$TIMEZONE_VAL"
@@ -313,7 +323,7 @@ finish_pem_key_handoff() {
                 printf "\n"
                 cat "$PEM_FILE"
                 printf "\n"
-                log_warning "Save everything including the BEGIN/END lines to ~/.ssh/$(basename "$PEM_FILE") on your computer, then run chmod 600 on it."
+                log_warning "Save everything including the BEGIN/END lines to $LOCAL_KEY_DIR/$(basename "$PEM_FILE") on your computer, then run chmod 600 on it."
                 ;;
             keep)
                 log_warning "Private key left at $PEM_FILE. Remove it once downloaded: shred -u $PEM_FILE"
@@ -337,7 +347,6 @@ detect_os
 
 # 2. Interactive Input Gather
 prompt_hostname
-prompt_timezone
 prompt_admin_username
 printf "\n=== Provisioning administrative user '%s' ===\n" "$TARGET_USER"
 
@@ -444,6 +453,11 @@ EOF
 fi
 chown "$TARGET_USER:$TARGET_USER" "$BASHRC"
 
+# The .bashrc above sets LC_ALL=en_US.UTF-8, so the locale must exist before
+# the admin's first login, or every shell prints "setlocale: cannot change locale".
+log_info "Generating the en_US.UTF-8 locale..."
+ensure_en_us_locale
+
 # Install minimal baseline requirements
 log_info "Installing system essentials..."
 apt-get install -y curl git nano rsyslog gnupg ca-certificates
@@ -498,17 +512,20 @@ STEP=$((STEP + 1))
 
 if [ -n "$PEM_FILE" ] && [ -f "$PEM_FILE" ]; then
     PEM_NAME="$(basename "$PEM_FILE")"
-    SSH_IDENTITY="-i ~/.ssh/$PEM_NAME -o IdentitiesOnly=yes "
+    SSH_IDENTITY="-i $LOCAL_KEY_DIR/$PEM_NAME -o IdentitiesOnly=yes "
     if [ "$PEM_OWNER" = "$TARGET_USER" ] || { [ "$PEM_OWNER" = "root" ] && [ -n "$SSH_ACCESS_IP" ]; }; then
         # scp would need the new key (own account) or a root SSH login, which a
         # hardened server refuses.
-        printf "%s. Copy the private key: type 'show' at the prompt below and save the output to ~/.ssh/%s on your computer.\n" "$STEP" "$PEM_NAME"
+        printf "%s. Copy the private key: type 'show' at the prompt below and save the output to %s/%s on your computer.\n" "$STEP" "$LOCAL_KEY_DIR" "$PEM_NAME"
     else
-        printf "%s. Download the private key (run this on your computer, not on the server):\n" "$STEP"
-        printf "   ${BLUE}scp %s%s@%s:%s ~/.ssh/%s${NC}\n" "$SCP_PORT_OPT" "$PEM_OWNER" "$SSH_HOST" "$PEM_FILE" "$PEM_NAME"
+        printf "%s. Download the private key (run these on your computer, not on the server):\n" "$STEP"
+        printf "   ${BLUE}mkdir -p %s${NC}\n" "$LOCAL_KEY_DIR"
+        printf "   ${BLUE}scp -i %s/YOUR_CURRENT_LOGIN_KEY.pem %s%s@%s:%s %s/%s${NC}\n" "$LOCAL_KEY_DIR" "$SCP_PORT_OPT" "$PEM_OWNER" "$SSH_HOST" "$PEM_FILE" "$LOCAL_KEY_DIR" "$PEM_NAME"
+        printf "   (-i is the key you used to log in as '%s', for example your cloud provider key)\n" "$PEM_OWNER"
+        printf "   If macOS says 'Operation not permitted', the folder is locked: ${BLUE}chflags nouchg %s${NC}\n" "$LOCAL_KEY_DIR"
     fi
-    printf "   ${BLUE}chmod 600 ~/.ssh/%s${NC}\n" "$PEM_NAME"
-    printf "   Optional, add a passphrase locally: ${BLUE}ssh-keygen -p -f ~/.ssh/%s${NC}\n" "$PEM_NAME"
+    printf "   ${BLUE}chmod 600 %s/%s${NC}\n" "$LOCAL_KEY_DIR" "$PEM_NAME"
+    printf "   Optional, add a passphrase locally: ${BLUE}ssh-keygen -p -f %s/%s${NC}\n" "$LOCAL_KEY_DIR" "$PEM_NAME"
     STEP=$((STEP + 1))
 fi
 
