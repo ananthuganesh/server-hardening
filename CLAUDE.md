@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Two interactive Bash scripts that turn a fresh Debian 13 (Trixie) server into a hardened server, plus a README that doubles as a manual reference for every step. There is no build system, package manager, or test suite. The scripts are edited here on macOS and **run only on the target server** (`scp bootstrap.sh setup.sh root@IP:/root/`). Never run them locally: they change users, sshd, the firewall, sysctl and more.
+Two interactive Bash scripts that turn a fresh Debian 13 (Trixie) server into a hardened server, plus a public-facing README. The README covers the quick start, a reference of every generated config (long listings in `<details>` blocks), operations and recovery. Keep it in plain English, provider-neutral, and free of personal or server-specific data. There is no build system, package manager, or test suite. The scripts are edited here on macOS and **run only on the target server** (`scp bootstrap.sh setup.sh root@IP:/root/`). Never run them locally: they change users, sshd, the firewall, sysctl and more.
 
 **Scope decisions (from the user):**
 - **Debian only.** `detect_os` exits on any non-Debian system; Debian releases other than 13 need a confirmation prompt. Do not add Ubuntu or other distro branches.
