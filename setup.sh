@@ -31,6 +31,9 @@ DEFAULT_SSH_PORT="2743"
 TARGET_PORT=""
 # Port sshd used before this run (read via sshd -T), to close its old UFW rule.
 PREVIOUS_SSH_PORT=""
+# done / pending / skipped, recorded by confirm_provider_firewall for check-health.sh
+PROVIDER_FIREWALL_STATE_FILE="/var/lib/server-setup/provider-firewall"
+PROVIDER_FIREWALL_STATUS=""
 HOSTNAME_VAL=""
 LYNIS_TARGET_SCORE=83
 SSH_ROLLBACK_UNIT="ssh-hardening-rollback"
@@ -578,8 +581,7 @@ install_tailscale() {
     fi
     
     log_info "Starting Tailscale and waiting for authentication..."
-    log_warning "Please authenticate the server in the browser link printed below:"
-    
+
     # --accept-routes=false: a subnet route advertised elsewhere in the tailnet
     # that overlaps this server's own network (for example a 10.x private/VPC
     # range) would pull its local traffic into Tailscale and cut it off.
@@ -592,11 +594,14 @@ install_tailscale() {
             log_error "tailscale set failed. Check: tailscale status"
             exit 1
         fi
-    elif ! tailscale up --ssh --accept-dns=true --accept-routes=false; then
-        log_error "tailscale up command failed! Please verify if tailscaled daemon is active."
-        exit 1
+    elif ! tailscale_login_with_auth_key; then
+        log_warning "Please authenticate the server in the browser link printed below:"
+        if ! tailscale up --ssh --accept-dns=true --accept-routes=false; then
+            log_error "tailscale up command failed! Please verify if tailscaled daemon is active."
+            exit 1
+        fi
     fi
-    
+
     log_info "Waiting for Tailscale connection to become fully active (Max 2 minutes)..."
     local timeout=120
     local elapsed=0
@@ -613,8 +618,66 @@ install_tailscale() {
     TAILSCALE_IP=$(tailscale ip -4 | tr -d '[:space:]')
     log_success "Tailscale active! Internal IP: $TAILSCALE_IP"
 
+    warn_if_tailscale_tagged
     check_tailscale_key_expiry
     remind_tailscale_ssh_policy
+}
+
+# Optional login with a Tailscale auth key, so a new server needs no browser.
+# Returns 0 when logged in with the key, 1 to fall back to the browser login.
+# The key is read hidden and handed over as --auth-key=file:..., so it never
+# appears in the process list, shell history or the auditd execve log, and the
+# temporary file is shredded right after use.
+tailscale_login_with_auth_key() {
+    local auth_key=""
+    local auth_key_file
+    local login_ok=1
+
+    log_info "To skip the browser login, paste a Tailscale auth key (admin console -> Settings -> Keys -> Generate auth key)."
+    while true; do
+        read -r -s -p "Tailscale auth key (input hidden; leave empty to log in via browser): " auth_key
+        printf "\n"
+        if [ -z "$auth_key" ]; then
+            return 1
+        fi
+        if [[ "$auth_key" =~ ^tskey-[A-Za-z0-9-]+$ ]]; then
+            break
+        fi
+        log_error "That doesn't look like a Tailscale auth key (it starts with tskey-). Try again, or leave it empty."
+    done
+
+    auth_key_file="$(mktemp /root/.tailscale-authkey.XXXXXX)"
+    chmod 600 "$auth_key_file"
+    # Remove the key file even if the script is interrupted during login.
+    trap "shred -u '$auth_key_file' 2>/dev/null || rm -f '$auth_key_file'" EXIT
+    printf '%s' "$auth_key" > "$auth_key_file"
+    auth_key=""
+
+    log_info "Logging in to Tailscale with the auth key..."
+    if tailscale up --ssh --accept-dns=true --accept-routes=false --auth-key="file:$auth_key_file"; then
+        log_success "Tailscale login with auth key succeeded."
+        login_ok=0
+    else
+        log_warning "Tailscale rejected the auth key (expired, already used or revoked). Falling back to browser login."
+    fi
+
+    shred -u "$auth_key_file" 2>/dev/null || rm -f "$auth_key_file"
+    trap - EXIT
+    return "$login_ok"
+}
+
+# Tagged auth keys make the server a tagged device. Those have no key expiry,
+# but they also stop matching the default Tailscale SSH rule
+# ("dst": ["autogroup:self"]), which would silently remove the emergency path.
+warn_if_tailscale_tagged() {
+    local tags
+
+    tags="$(tailscale status --json 2>/dev/null | jq -r '(.Self.Tags // []) | join(", ")' 2>/dev/null || true)"
+    if [ -n "$tags" ]; then
+        log_warning "This server joined Tailscale with tags: $tags"
+        log_warning "Tagged servers do not match the default Tailscale SSH rule (\"dst\": [\"autogroup:self\"])."
+        log_warning "For the emergency Tailscale SSH path, add an ssh rule with \"dst\": [the tag] and \"users\": [\"autogroup:nonroot\"]."
+    fi
 }
 
 # --ssh keeps Tailscale SSH on port 22 of the Tailscale IP as an emergency path
@@ -2051,11 +2114,80 @@ else
     echo "No Lynis report found yet. Run: sudo lynis audit system --quick"
 fi
 
+echo -e "\n${YELLOW}11. Cloud Provider Firewall:${NC}"
+case "$(cat /var/lib/server-setup/provider-firewall 2>/dev/null)" in
+    done) echo "Marked as configured." ;;
+    skipped) echo "Skipped (UFW on the server enforces the rules)." ;;
+    *)
+        echo -e "${RED}Not configured yet: allow TCP 80, TCP 443 and UDP 443; remove TCP 22; add no SSH rule.${NC}"
+        echo "When done, mark it: echo done | sudo tee /var/lib/server-setup/provider-firewall"
+        ;;
+esac
+
 EOF
 
     chmod +x "$hc_script"
     chown "$TARGET_USER:$TARGET_USER" "$hc_script"
     log_success "Diagnostic utility written to $hc_script."
+}
+
+# 16. Cloud Provider Firewall
+# The provider's firewall / security group can't be configured from inside the
+# server and differs per provider, so print the exact rules, ask whether they
+# are set, and record the answer for check-health.sh. Asked at the very end,
+# after SSH over Tailscale was verified, so removing public port 22 is safe.
+confirm_provider_firewall() {
+    printf "\n=== 14. Cloud Provider Firewall ===\n"
+
+    local previous
+    local answer
+
+    previous="$(cat "$PROVIDER_FIREWALL_STATE_FILE" 2>/dev/null || true)"
+    if [ "$previous" = "done" ] || [ "$previous" = "skipped" ]; then
+        PROVIDER_FIREWALL_STATUS="$previous"
+        log_info "Provider firewall was marked '$previous' on an earlier run; not asking again."
+        return 0
+    fi
+
+    log_info "Set these inbound rules in your cloud provider's firewall / security group:"
+    printf "   ALLOW   TCP 80      from 0.0.0.0/0 and ::/0   HTTP (Caddy, HTTPS certificate issuance)\n"
+    printf "   ALLOW   TCP 443     from 0.0.0.0/0 and ::/0   HTTPS\n"
+    printf "   ALLOW   UDP 443     from 0.0.0.0/0 and ::/0   HTTP/3\n"
+    printf "   ALLOW   UDP 41641   from 0.0.0.0/0 and ::/0   optional: direct Tailscale connections\n"
+    printf "   REMOVE  TCP 22, and do NOT open TCP %s: SSH works only inside Tailscale\n" "$TARGET_PORT"
+    printf "   OUTBOUND: allow all (Tailscale, updates, CrowdSec, Docker)\n"
+    log_warning "Before removing port 22, confirm the provider's emergency console gives you a login prompt."
+    log_info "No network firewall at your provider? Choose skip: UFW already enforces the same rules on this server."
+
+    while true; do
+        read -r -p "Provider firewall configured? (done/not/skip): " answer
+        answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
+        case "$answer" in
+            done|d)
+                PROVIDER_FIREWALL_STATUS="done"
+                log_success "Provider firewall marked as configured."
+                break
+                ;;
+            not|n|no)
+                PROVIDER_FIREWALL_STATUS="pending"
+                log_warning "Not configured yet; ~/check-health.sh will keep reminding you."
+                log_warning "When done, mark it: echo done | sudo tee $PROVIDER_FIREWALL_STATE_FILE"
+                break
+                ;;
+            skip|s)
+                PROVIDER_FIREWALL_STATUS="skipped"
+                log_info "Provider firewall skipped; UFW on this server enforces the rules."
+                break
+                ;;
+            *)
+                log_warning "Please type done, not, or skip."
+                ;;
+        esac
+    done
+
+    mkdir -p "$(dirname "$PROVIDER_FIREWALL_STATE_FILE")"
+    printf '%s\n' "$PROVIDER_FIREWALL_STATUS" > "$PROVIDER_FIREWALL_STATE_FILE"
+    chmod 644 "$PROVIDER_FIREWALL_STATE_FILE"
 }
 
 # 15. Lynis Audit
@@ -2129,6 +2261,7 @@ main() {
     create_health_check
     verify_automatic_updates
     run_lynis_audit
+    confirm_provider_firewall
     
     local ts_ip
     ts_ip=$(tailscale ip -4 | tr -d '[:space:]')
@@ -2146,6 +2279,7 @@ main() {
     printf " - Automatic updates:          ${CYAN}nightly 03:30, reboots manual (~/check-health.sh)${NC}\n"
     printf " - Tailscale SSH policy:       ${CYAN}set \"users\": [\"autogroup:nonroot\"] in the tailnet policy${NC}\n"
     printf " - GitHub deploy key per repo: ${CYAN}~/github-deploy-key.sh OWNER/REPO${NC}\n"
+    printf " - Provider firewall:          ${CYAN}%s${NC}\n" "$PROVIDER_FIREWALL_STATUS"
     printf "${GREEN}======================================================================${NC}\n\n"
 }
 

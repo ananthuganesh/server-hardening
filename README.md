@@ -146,7 +146,11 @@ In the commands below, `SSH_PORT` means the port you chose.
 * The admin user must have a valid key in `~/.ssh/authorized_keys`, or Phase 2 stops. It also fixes permissions on the home directory, `~/.ssh` and `authorized_keys`, because with `StrictModes` sshd silently ignores keys when those are writable by other users.
 * The admin user must have a usable password, or Phase 2 asks you to set one. Root gets locked, and the emergency console needs a password.
 
-1. **Tailscale login**: The script runs `tailscale up --ssh --accept-dns=true --accept-routes=false`, prints a unique Tailscale login URL, and waits up to 2 minutes for activation. If Tailscale fails or times out, the script stops before touching SSH.
+1. **Tailscale login**: The script asks for an optional **Tailscale auth key** (hidden input).
+   * **With a key:** the server joins your tailnet with no browser step.
+   * **Empty, or the key is rejected:** it runs `tailscale up --ssh --accept-dns=true --accept-routes=false` and prints a login URL to open in the browser.
+
+   Either way it waits up to 2 minutes for activation. If Tailscale fails or times out, the script stops before touching SSH. On reruns the server is already logged in, so there's no prompt. See [Tailscale auth keys](#tailscale-auth-keys-skip-the-browser-login).
    * **Key expiry check**: Tailscale node keys expire after 180 days by default. When that happens, the server leaves the tailnet and SSH is gone. If expiry is enabled, the script stops and asks you to disable it: **Tailscale admin console → Machines → server → ⋯ → Disable key expiry**.
    * `--accept-routes=false`: if another tailnet device advertises a subnet route that overlaps this server's own network (for example a 10.x private or VPC range), accepting it would pull local traffic into Tailscale and cut the server off.
 2. **UFW & SSH Verification Gate**: The script arms a 10-minute automatic rollback, moves SSH to the port you chose (see **SSH port** below), restricts that port to the Tailscale interface in UFW, and pauses.
@@ -157,6 +161,7 @@ In the commands below, `SSH_PORT` means the port you chose.
    * If it fails, enter **`no`**. The script restores your previous SSH config and disables UFW entirely to ensure you are not locked out.
    * If your session dies before you answer, the rollback timer restores the previous SSH config and disables UFW automatically after 10 minutes.
 3. **CrowdSec Console Key**: The script prompts for your CrowdSec dashboard enrollment key. Paste it to register the node, or press Enter to skip.
+4. **Cloud provider firewall** (last step): The script prints the exact inbound rules for your provider's firewall or security group: allow TCP 80, TCP 443 and UDP 443, and remove TCP 22. Then it asks `done`, `not` or `skip`. See [Step 6](#step-6-cloud-provider-firewall).
 
 ---
 
@@ -248,6 +253,24 @@ tailscale ip -4 # Retrieve your VPN IP (e.g. 100.116.117.35)
 tailscale status --json | jq -r '.Self.KeyExpiry // "key expiry disabled"'
 ```
 The automated script stops if `tailscale up` fails or if Tailscale does not become active within 2 minutes.
+
+#### Tailscale auth keys (skip the browser login)
+Every server joins your tailnet as its own device. Your Mac being logged in doesn't authorize the server, which is why a browser link appears. To skip that step, create an auth key in the **Tailscale admin console → Settings → Keys → Generate auth key**, and paste it when Phase 2 asks.
+
+**How the script handles the key:**
+* It reads the key hidden, never prints it, and never stores it. Leave the prompt empty to use the browser login.
+* It passes the key as `--auth-key=file:/root/.tailscale-authkey.XXXXXX`, a root-only temporary file shredded right after login. The key never appears in the process list, shell history or the auditd log of root commands.
+* If Tailscale rejects the key (expired, already used, revoked), it falls back to the browser login.
+
+**Recommended key settings:**
+| Setting | Recommendation |
+|---|---|
+| Reusable | Only if you set up several servers in a row; revoke it afterwards. A one-off key is safest. |
+| Expiration | Short (1–7 days). This is how long the *key* can be used, not the server's own key expiry. |
+| Pre-approved | On, if your tailnet requires device approval; otherwise the server waits for approval in the console. |
+| Tags | Optional. Tagged servers get **no key expiry**, but they no longer match the default Tailscale SSH rule (`"dst": ["autogroup:self"]`). The script warns about this. Add an `ssh` rule with `"dst": ["tag:server"]` and `"users": ["autogroup:nonroot"]`, or the emergency Tailscale SSH path is gone. |
+
+> An auth key lets anyone who has it add devices to your tailnet. Treat it like a password, never commit it, and revoke it once your servers are set up.
 
 **Disable key expiry for every server** in the Tailscale admin console. SSH is reachable only through Tailscale, so an expired node key means a lockout until you use the emergency console. `~/check-health.sh` reports the expiry date.
 
@@ -364,7 +387,15 @@ Most providers offer a network firewall in front of the server (called a firewal
 * **No SSH rule.** SSH traffic travels inside the encrypted Tailscale tunnel, so the provider firewall never sees the SSH port. Don't open 22 or your SSH port publicly.
 * **Outbound**: Allow all outbound traffic. Tailscale and CrowdSec need it, and so do apt and Docker.
 
-Apply this firewall only after Phase 2 succeeds and you have tested a reboot. If your provider has no network firewall, UFW (Step 5) still enforces the same policy on the server.
+**Phase 2 prompts for this at the end.** It prints these rules, using your SSH port, then asks `Provider firewall configured? (done/not/skip)`:
+
+| Answer | Meaning | Afterwards |
+|---|---|---|
+| `done` | You set the rules in the provider panel | Not asked again on reruns |
+| `not` | Not set yet | `~/check-health.sh` reminds you until you mark it: `echo done \| sudo tee /var/lib/server-setup/provider-firewall` |
+| `skip` | Your provider has no network firewall | Not asked again; UFW enforces the same rules on the server |
+
+The answer is saved in `/var/lib/server-setup/provider-firewall`. It's asked only at the end, after SSH over Tailscale was verified, so removing public port 22 at that point doesn't lock you out. Test a reboot soon after. If your provider has no network firewall, UFW (Step 5) still enforces the same policy on the server.
 
 > Once public port 22 is closed, the automatic SSH rollback (which restores the old port-22 config) is reachable only over Tailscale or the emergency console. Test the console first.
 
