@@ -521,7 +521,10 @@ EOF
       ncdu \
       tree \
       lsof \
+      iotop \
       psmisc \
+      plocate \
+      tcpdump \
       net-tools \
       dnsutils \
       traceroute \

@@ -240,7 +240,7 @@ Phase 2 ends with a Lynis security audit and a summary of how to reach the serve
 
 ### Base system
 
-- **Tools:** `btop`, `htop`, `tmux`, `jq`, `curl`, `wget`, `git`, `vim`, `rsync`, `ncdu`, `tree`, `lsof`, `mtr-tiny`, `ripgrep`, `fd-find`, DNS tools and more.
+- **Tools:** `btop`, `htop`, `iotop`, `tmux`, `jq`, `curl`, `wget`, `git`, `vim`, `rsync`, `ncdu`, `tree`, `lsof`, `tcpdump`, `mtr-tiny`, `traceroute`, `ripgrep`, `fd-find` (the command is `fdfind`), `plocate`, DNS tools and more.
 - **Locale:** `en_US.UTF-8` is verified after generation, and built directly with `localedef` if `locale-gen` failed silently.
 - **Time sync:** `systemd-timesyncd` is enabled if no time sync service is running.
 - **rsyslog:** routes SSH logs, including Debian 13's `sshd-session` process, to `/var/log/auth.log`.
