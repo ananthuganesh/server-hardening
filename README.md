@@ -4,7 +4,7 @@ Two interactive Bash scripts that turn a fresh **Debian 13 (Trixie)** server int
 - SSH reachable only through Tailscale;
 - a firewall, intrusion prevention, kernel and audit hardening;
 - automatic updates;
-- the Caddy web server and Docker.
+- the Caddy web server, and Docker or rootless Podman.
 
 The scripts are **provider-neutral**: they work on any VPS or cloud server running Debian.
 
@@ -41,7 +41,7 @@ The scripts are **provider-neutral**: they work on any VPS or cloud server runni
 **Network protection**
 - A **UFW** firewall: deny by default, with only web ports public.
 - **CrowdSec** intrusion prevention with an nftables bouncer, reading SSH and web logs.
-- **Docker ports can't bypass the firewall**: containers publish on `127.0.0.1` by default, and firewall rules guard containers you publish publicly.
+- **Container ports can't bypass the firewall**: with Docker, containers publish on `127.0.0.1` by default and extra rules guard anything published publicly; rootless Podman is covered by UFW on its own.
 
 **System hardening**
 - Modern-only SSH cryptography, filtered to what the installed OpenSSH supports.
@@ -50,9 +50,9 @@ The scripts are **provider-neutral**: they work on any VPS or cloud server runni
 - A root account that stays locked, but an emergency boot shell that still works from the provider console.
 
 **Operations**
-- **Automatic nightly updates** for Debian, Tailscale, Docker, CrowdSec and Caddy, with safeguards so configs are never overwritten.
+- **Automatic nightly updates** for Debian, Tailscale, CrowdSec, Caddy and Docker (Podman updates come with Debian), with safeguards so configs are never overwritten.
 - The **Caddy** web server with automatic HTTPS and HTTP/3, plus a separate folder for your own sites.
-- **Docker Engine** with a hardened daemon configuration.
+- **Docker Engine or rootless Podman**, your choice at setup time, both with hardened settings.
 - A **GitHub deploy key helper** that creates one key per repository.
 - A **health check script** and a **Lynis** security audit (target score 83+; a test run scored 85).
 
@@ -65,7 +65,7 @@ Setup runs in two phases, both **on the server**:
 | Phase | Script | Runs as | What it does |
 |---|---|---|---|
 | 1 | `bootstrap.sh` | `root`, or `sudo` from the provider's default user | Sets the hostname and timezone, creates your admin user, generates the SSH login key, and copies `setup.sh` into the admin user's home |
-| 2 | `setup.sh` | The new admin user, with `sudo` | Hardens the whole system: Tailscale, SSH, firewall, CrowdSec, kernel, updates, Caddy and Docker |
+| 2 | `setup.sh` | The new admin user, with `sudo` | Hardens the whole system: Tailscale, SSH, firewall, CrowdSec, kernel, updates, Caddy and your container engine |
 
 The finished server is protected in layers:
 
@@ -83,7 +83,7 @@ Internet
    │
    ├─ CrowdSec    bans attackers found in SSH and Caddy logs (Tailscale IPs are never banned)
    ├─ Caddy       automatic HTTPS, HTTP/3, your sites in /etc/caddy/sites/
-   └─ Docker      containers published on 127.0.0.1 by default
+   └─ Containers  Docker (published on 127.0.0.1 by default) or rootless Podman
 
 Tailscale (100.x.x.x)
    ├─ SSH on your chosen port  → admin login with the .pem key
@@ -196,6 +196,7 @@ It asks, in this order:
 | Prompt | What to do |
 |---|---|
 | SSH port | Press Enter for `2743`, or type another port (1024–65535) |
+| Container engine | Press Enter for `docker`, or type `podman` for rootless containers ([comparison](#containers-docker-or-podman)) |
 | Tailscale auth key | Paste a key to skip the browser, or press Enter and open the login link it prints |
 | Tailscale key expiry | In the Tailscale admin console, open **Machines**, select this server, and choose **Disable key expiry**. Then press Enter |
 | **SSH verification** | Keep this terminal open. From a **new terminal**, run the command it shows: `ssh -i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes -p SSH_PORT ADMIN@TAILSCALE_IP`. If it works, type `yes`. If not, type `no` to roll back |
@@ -533,7 +534,7 @@ Updates use Debian's `unattended-upgrades` on its systemd timers, not a raw cron
 
 | Setting | Value |
 |---|---|
-| What updates | Debian (stable, point releases, security), Tailscale, Docker, CrowdSec, Caddy |
+| What updates | Debian (stable, point releases, security), Tailscale, CrowdSec, Caddy, and Docker when chosen. Podman comes from Debian itself |
 | When | Package lists at 02:30, installs at **03:30 server time**. A missed window is skipped |
 | Config files | Kept (`--force-confold`), so an upgrade never resets `sshd_config`, UFW rules or the Caddyfile |
 | Services | `needrestart` restarts services that still use old libraries |
@@ -566,7 +567,24 @@ sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
 
 Point the domain's DNS at the server first; Caddy then gets the certificate automatically.
 
-### Docker
+### Containers: Docker or Podman
+
+Phase 2 asks which engine to install. Both are hardened; they differ in how much root they need.
+
+| | Docker (default) | Rootless Podman |
+|---|---|---|
+| Containers run as | root | your admin user |
+| Root-equivalent group | Yes: the admin user joins the `docker` group | None |
+| Firewall | Docker's own rules skip UFW, so the setup adds rules to put containers back behind it | Published ports go through the normal path, so UFW applies |
+| Compose | `docker compose` (reference implementation) | `podman-compose`; occasional differences on complex files |
+| Updates | Docker's own repository, added to the nightly updates | Debian's own repositories |
+| Tooling that needs a Docker socket | Works | Often needs extra work |
+
+Pick **Docker** if you use Compose files or tools that talk to the Docker socket. Pick **Podman** if you want the strongest isolation and your apps are plain services behind Caddy.
+
+Your choice is saved in `/var/lib/server-setup/container-engine`, which the health check reads.
+
+#### Docker
 
 <details>
 <summary><b><code>/etc/docker/daemon.json</code></b></summary>
@@ -594,6 +612,21 @@ Point the domain's DNS at the server first; Caddy then gets the certificate auto
 
 - **Firewall rules:** Docker's own iptables rules normally bypass UFW. The script adds [ufw-docker](https://github.com/chaifeng/ufw-docker)-style rules to `/etc/ufw/after.rules`, so new public connections to containers are dropped. To expose a container port publicly on purpose, allow it with `sudo ufw route allow proto tcp from any to any port CONTAINER_PORT`.
 - **Port 8080 is taken:** don't publish containers on host port 8080, because CrowdSec's local API uses it.
+
+#### Rootless Podman
+
+- **Packages:** `podman`, `podman-docker` (so `docker …` commands still work), `podman-compose`, plus `uidmap` and `passt` for rootless networking.
+- **Runs as your admin user.** There is no daemon and no root-equivalent group. A container breakout lands as that user, not root.
+- **Starts at boot:** lingering is enabled for the admin user, so rootless containers come back after a reboot without anyone logging in.
+- **Enabled for that user:** the Podman socket (for Compose and other tools) and the image auto-update timer.
+- **Log size** is capped in `/etc/containers/containers.conf.d/99-hardening.conf`.
+
+Two differences to keep in mind:
+
+```bash
+podman run -p 127.0.0.1:3000:80 image     # always name the address: Podman has no default bind address
+```
+- **Don't use `sudo podman`.** Rootful containers get firewall rules that bypass UFW, exactly like Docker's.
 
 ### GitHub deploy keys
 
@@ -671,6 +704,7 @@ sudo lynis audit system --quick
 | Setting | Default | Where to change it |
 |---|---|---|
 | SSH port | `2743` | Prompted in Phase 2 (`DEFAULT_SSH_PORT` in `setup.sh`) |
+| Container engine | `docker` | Prompted in Phase 2 (`DEFAULT_CONTAINER_ENGINE` in `setup.sh`) |
 | Timezone | `Asia/Kolkata` | `TIMEZONE_VAL` in `bootstrap.sh` |
 | Local key folder in printed commands | `~/keys` | `LOCAL_KEY_DIR` in `bootstrap.sh` |
 | Update window | 03:30 | `/etc/systemd/system/apt-daily-upgrade.timer.d/override.conf` on the server |
@@ -690,6 +724,7 @@ Both scripts are safe to run again.
 - **`setup.sh`:**
   - SSH port, auth key and firewall prompts: on a rerun, pressing Enter at the port prompt keeps the current port, and there's no auth-key prompt if Tailscale is already logged in. The provider firewall question isn't asked again once answered `done` or `skip`.
   - Existing admins stay in `AllowUsers`.
+  - Switching container engine: the new engine is installed, but the old one is left in place. Remove it yourself once the new one works, since both compete for published ports.
   - Changing the SSH port closes the old port's firewall rule.
 
 **Servers set up by older versions:**
@@ -721,7 +756,7 @@ If you can't reach the server over Tailscale, log in through your **provider's e
 ## Security notes and limitations
 
 - **Your Tailscale login is as powerful as the SSH key**, because it grants Tailscale SSH access. Protect it with two-factor login and keep check mode on.
-- **The `docker` group is root-equivalent.** The admin user is a member. Protect the SSH key with a passphrase, or remove the user from the group (`sudo gpasswd -d ADMIN docker`) and use `sudo docker`.
+- **With Docker, the `docker` group is root-equivalent.** The admin user is a member. Protect the SSH key with a passphrase, remove the user from the group (`sudo gpasswd -d ADMIN docker`) and use `sudo docker`, or choose rootless Podman instead.
 - **Reboots are manual.** Kernel fixes only apply after a reboot.
 - **Not included:**
   - backups;

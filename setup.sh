@@ -34,6 +34,10 @@ PREVIOUS_SSH_PORT=""
 # done / pending / skipped, recorded by confirm_provider_firewall for check-health.sh
 PROVIDER_FIREWALL_STATE_FILE="/var/lib/server-setup/provider-firewall"
 PROVIDER_FIREWALL_STATUS=""
+# docker or podman, chosen in verify_environment; read back by check-health.sh
+DEFAULT_CONTAINER_ENGINE="docker"
+CONTAINER_ENGINE=""
+CONTAINER_ENGINE_STATE_FILE="/var/lib/server-setup/container-engine"
 HOSTNAME_VAL=""
 LYNIS_TARGET_SCORE=83
 SSH_ROLLBACK_UNIT="ssh-hardening-rollback"
@@ -324,6 +328,32 @@ prompt_ssh_port() {
     log_info "SSH will listen on port $TARGET_PORT (Tailscale only)."
 }
 
+# Docker or rootless Podman. Docker is the default because Compose and most
+# tooling assume it. Rootless Podman has no root-equivalent group, and its
+# published ports stay subject to UFW.
+prompt_container_engine() {
+    local engine_input
+    local default_engine="$DEFAULT_CONTAINER_ENGINE"
+
+    if command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+        default_engine="podman"
+    fi
+
+    printf "\n"
+    log_info "Container engine:"
+    printf "  docker  Docker Engine with Compose. Containers run as root, and '%s' joins the root-equivalent docker group.\n" "$TARGET_USER"
+    printf "  podman  Rootless Podman as '%s'. No root-equivalent group, and published ports stay behind UFW.\n" "$TARGET_USER"
+    while true; do
+        read -r -p "Which container engine? [docker/podman] ($default_engine): " engine_input
+        CONTAINER_ENGINE="$(printf '%s' "${engine_input:-$default_engine}" | tr '[:upper:]' '[:lower:]')"
+        case "$CONTAINER_ENGINE" in
+            docker|podman) break ;;
+            *) log_error "Please type docker or podman." ;;
+        esac
+    done
+    log_info "Container engine: $CONTAINER_ENGINE"
+}
+
 # Root gets locked in Phase 2, and provider emergency consoles log in with a
 # password, not a key. Without a usable admin password there is no way back in
 # if Tailscale or SSH ever breaks.
@@ -356,6 +386,7 @@ verify_environment() {
     check_admin_ssh_keys
     ensure_admin_password
     prompt_ssh_port
+    prompt_container_engine
 
     # Hostname and timezone are set in bootstrap.sh (Phase 1); Phase 2 only reads them.
     HOSTNAME_VAL="$(hostname -s)"
@@ -1348,7 +1379,6 @@ Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
         // Third-party repositories added by setup.sh
         "origin=Tailscale,label=Tailscale";
-        "origin=Docker,label=Docker CE";
         "origin=packagecloud.io/crowdsec/crowdsec";
         "origin=cloudsmith/caddy/stable";
 };
@@ -1374,6 +1404,11 @@ Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::SyslogEnable "true";
 Unattended-Upgrade::SyslogFacility "daemon";
 EOF
+
+    # Docker ships its own repository; Podman comes from Debian itself.
+    if [ "$CONTAINER_ENGINE" = "docker" ]; then
+        sed -i 's|^\( *\)"origin=Tailscale,label=Tailscale";|&\n\1"origin=Docker,label=Docker CE";|' /etc/apt/apt.conf.d/50unattended-upgrades
+    fi
 
     # Fixed maintenance window in the server's time zone instead of the
     # default random daytime slot.
@@ -1422,8 +1457,13 @@ verify_automatic_updates() {
 
     # Every third-party origin in 50unattended-upgrades must match a configured
     # repository, or that software silently never updates.
+    local origins=(Debian Tailscale packagecloud.io/crowdsec/crowdsec cloudsmith/caddy/stable)
+    if [ "$CONTAINER_ENGINE" = "docker" ]; then
+        origins+=("Docker")
+    fi
+
     policy="$(LC_ALL=C apt-cache policy 2>/dev/null || true)"
-    for origin in Debian Tailscale Docker packagecloud.io/crowdsec/crowdsec cloudsmith/caddy/stable; do
+    for origin in "${origins[@]}"; do
         if grep -qF "o=$origin," <<< "$policy"; then
             log_success "Automatic updates cover repository origin '$origin'."
         else
@@ -1920,6 +1960,59 @@ configure_docker() {
     log_success "Docker Engine configured successfully."
 }
 
+# 12b. Rootless Podman (alternative to Docker)
+configure_podman() {
+    printf "\n=== 10. Rootless Podman Configuration ===\n"
+
+    local uid
+    local user_env
+
+    if grep -q "install ok installed" <<< "$(dpkg-query -W -f='${Status}' docker-ce 2>/dev/null || true)"; then
+        log_warning "Docker CE is still installed; both engines compete for published ports."
+        log_warning "Remove it once Podman works: sudo apt purge docker-ce docker-ce-cli"
+    fi
+
+    log_info "Installing Podman with the docker-compatible CLI and Compose support..."
+    apt-get install -y podman podman-docker podman-compose uidmap passt dbus-user-session
+
+    # Rootless containers run under the admin user's own systemd instance,
+    # which must keep running while nobody is logged in.
+    log_info "Enabling lingering for '$TARGET_USER' so rootless containers start at boot..."
+    loginctl enable-linger "$TARGET_USER"
+
+    log_info "Limiting container log size..."
+    mkdir -p /etc/containers/containers.conf.d
+    cat << 'EOF' > /etc/containers/containers.conf.d/99-hardening.conf
+# Managed by setup.sh
+[containers]
+log_size_max = 10485760
+EOF
+    chmod 644 /etc/containers/containers.conf.d/99-hardening.conf
+
+    uid="$(id -u "$TARGET_USER")"
+    user_env=(XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus")
+    log_info "Enabling the rootless Podman socket and image auto-update timer for '$TARGET_USER'..."
+    if ! runuser -u "$TARGET_USER" -- env "${user_env[@]}" systemctl --user enable --now podman.socket podman-auto-update.timer; then
+        log_warning "Could not enable the user services now. Run this as '$TARGET_USER': systemctl --user enable --now podman.socket podman-auto-update.timer"
+    fi
+
+    log_success "Rootless Podman is ready. Run containers as '$TARGET_USER', without sudo."
+    log_warning "Publish ports on localhost explicitly: podman run -p 127.0.0.1:3000:80 ... (Podman has no global default bind address)"
+    log_warning "Avoid 'sudo podman': rootful published ports get firewall rules that bypass UFW, like Docker's."
+}
+
+configure_container_engine() {
+    if [ "$CONTAINER_ENGINE" = "podman" ]; then
+        configure_podman
+    else
+        configure_docker
+    fi
+
+    mkdir -p "$(dirname "$CONTAINER_ENGINE_STATE_FILE")"
+    printf '%s\n' "$CONTAINER_ENGINE" > "$CONTAINER_ENGINE_STATE_FILE"
+    chmod 644 "$CONTAINER_ENGINE_STATE_FILE"
+}
+
 # 13. GitHub Deploy Key Helper
 # GitHub accepts a deploy key on only one repository, so there is no shared
 # server key. Instead install a helper that creates one key and one SSH host
@@ -2054,8 +2147,13 @@ NC='\033[0m'
 
 echo -e "${GREEN}=== Hardened Server Health Diagnostic ===${NC}"
 
-echo -e "\n${YELLOW}1. Docker Container Statuses:${NC}"
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+echo -e "\n${YELLOW}1. Container Statuses:${NC}"
+engine="$(cat /var/lib/server-setup/container-engine 2>/dev/null || echo docker)"
+if command -v "$engine" >/dev/null 2>&1; then
+    "$engine" ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+else
+    echo "$engine is not installed."
+fi
 
 echo -e "\n${YELLOW}2. Storage Volume Usage:${NC}"
 df -h /
@@ -2256,7 +2354,7 @@ main() {
     configure_kernel_hardening
     configure_security_packages
     configure_caddy
-    configure_docker
+    configure_container_engine
     install_github_deploy_key_helper
     create_health_check
     verify_automatic_updates
@@ -2280,6 +2378,7 @@ main() {
     printf " - Tailscale SSH policy:       ${CYAN}set \"users\": [\"autogroup:nonroot\"] in the tailnet policy${NC}\n"
     printf " - GitHub deploy key per repo: ${CYAN}~/github-deploy-key.sh OWNER/REPO${NC}\n"
     printf " - Provider firewall:          ${CYAN}%s${NC}\n" "$PROVIDER_FIREWALL_STATUS"
+    printf " - Container engine:           ${CYAN}%s${NC}\n" "$CONTAINER_ENGINE"
     printf "${GREEN}======================================================================${NC}\n\n"
 }
 
