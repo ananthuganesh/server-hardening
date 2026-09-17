@@ -49,6 +49,10 @@ WG_INTERFACE="wg0"
 WG_PORT="51820"
 WG_SUBNET="10.66.66"
 WG_CONFIG_DIR="/etc/wireguard"
+# yes/no: route all client internet traffic through this server
+VPN_FULL_TUNNEL="no"
+VPN_FULL_TUNNEL_STATE_FILE="/var/lib/server-setup/vpn-full-tunnel"
+VPN_EGRESS_INTERFACE=""
 HOSTNAME_VAL=""
 LYNIS_TARGET_SCORE=83
 SSH_ROLLBACK_UNIT="ssh-hardening-rollback"
@@ -362,6 +366,81 @@ prompt_vpn_engine() {
         esac
     done
     log_info "Admin VPN: $VPN_ENGINE"
+
+    # Optional: use the server as the internet gateway for connected devices.
+    local tunnel_input
+    printf "\n"
+    if [ "$VPN_ENGINE" = "wireguard" ]; then
+        log_info "Full tunnel routes ALL internet traffic from your connected devices through this server."
+        printf "  Your traffic then leaves from the server's IP address and uses its bandwidth.\n"
+        printf "  Answer no to keep a split tunnel, where only server traffic uses the VPN.\n"
+        read -r -p "Route all client internet traffic through this server? (y/N): " tunnel_input
+    else
+        log_info "Exit node lets your devices send ALL internet traffic through this server (Tailscale's full tunnel)."
+        printf "  You still have to approve it in the admin console and select it on each device.\n"
+        read -r -p "Advertise this server as a Tailscale exit node? (y/N): " tunnel_input
+    fi
+    if [[ "$tunnel_input" =~ ^[Yy]$ ]]; then
+        VPN_FULL_TUNNEL="yes"
+        log_info "Full tunnel: enabled"
+    else
+        VPN_FULL_TUNNEL="no"
+        log_info "Full tunnel: disabled (split tunnel)"
+    fi
+}
+
+# Forwarding is needed to pass client traffic to the internet. The kernel
+# hardening file deliberately leaves forwarding alone (Docker needs it), so
+# set it explicitly here.
+enable_ip_forwarding() {
+    log_info "Enabling IPv4 forwarding for the VPN gateway..."
+    cat << 'EOF' > /etc/sysctl.d/61-vpn-forward.conf
+# Managed by setup.sh: required to route VPN client traffic to the internet.
+net.ipv4.ip_forward = 1
+EOF
+    sysctl -p /etc/sysctl.d/61-vpn-forward.conf
+}
+
+# Default route interface that client traffic leaves through.
+detect_egress_interface() {
+    VPN_EGRESS_INTERFACE="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+    if [ -z "$VPN_EGRESS_INTERFACE" ]; then
+        log_error "Could not determine the default network interface for the full tunnel."
+        exit 1
+    fi
+    log_info "Client traffic will leave through $VPN_EGRESS_INTERFACE."
+}
+
+# Masquerade WireGuard client traffic. The rule goes in a marker-delimited
+# block in ufw's before.rules. It deliberately does NOT declare
+# ":POSTROUTING", because that would flush the chain on every ufw reload and
+# break Docker's own NAT rules.
+configure_wireguard_nat() {
+    local before_rules="/etc/ufw/before.rules"
+
+    if [ ! -f "$before_rules" ]; then
+        log_warning "$before_rules is missing; skipping NAT setup. Install ufw and rerun."
+        return 0
+    fi
+
+    log_info "Adding NAT for $WG_SUBNET.0/24 out of $VPN_EGRESS_INTERFACE..."
+    cp "$before_rules" "$before_rules.pre-vpn.bak"
+    sed -i '/^# BEGIN VPN FULL TUNNEL$/,/^# END VPN FULL TUNNEL$/d' "$before_rules"
+    cat >> "$before_rules" << EOF
+# BEGIN VPN FULL TUNNEL
+*nat
+-A POSTROUTING -s $WG_SUBNET.0/24 -o $VPN_EGRESS_INTERFACE -j MASQUERADE
+COMMIT
+# END VPN FULL TUNNEL
+EOF
+
+    if grep -q '^Status: active' <<< "$(ufw status 2>/dev/null || true)"; then
+        if ! ufw reload; then
+            log_warning "UFW rejected the NAT rules; restoring the previous before.rules."
+            cp "$before_rules.pre-vpn.bak" "$before_rules"
+            ufw reload || log_warning "UFW reload with the restored rules also failed; check: ufw status verbose"
+        fi
+    fi
 }
 
 # Docker or rootless Podman. Docker is the default because Compose and most
@@ -689,6 +768,17 @@ install_tailscale() {
     TAILSCALE_IP=$(tailscale ip -4 | tr -d '[:space:]')
     log_success "Tailscale active! Internal IP: $TAILSCALE_IP"
 
+    if [ "$VPN_FULL_TUNNEL" = "yes" ]; then
+        enable_ip_forwarding
+        log_info "Advertising this server as a Tailscale exit node..."
+        if tailscale set --advertise-exit-node; then
+            log_success "Exit node advertised."
+            log_warning "Approve it in the Tailscale admin console (Machines -> this server -> Edit route settings), then select it on each device."
+        else
+            log_warning "Could not advertise the exit node. Run manually: tailscale set --advertise-exit-node"
+        fi
+    fi
+
     warn_if_tailscale_tagged
     check_tailscale_key_expiry
     remind_tailscale_ssh_policy
@@ -893,6 +983,14 @@ EOF
     chmod 600 "$config"
     wg_add_peer_if_missing "$client_pub" "$WG_SUBNET.2" "$client_name"
 
+    local client_allowed_ips="$WG_SUBNET.0/24"
+    if [ "$VPN_FULL_TUNNEL" = "yes" ]; then
+        client_allowed_ips="0.0.0.0/0"
+        detect_egress_interface
+        enable_ip_forwarding
+        configure_wireguard_nat
+    fi
+
     log_info "Writing the client configuration $client_conf..."
     cat > "$client_conf" << EOF
 [Interface]
@@ -903,8 +1001,7 @@ Address = $WG_SUBNET.2/32
 [Peer]
 PublicKey = $server_pub
 Endpoint = $endpoint:$WG_PORT
-# Split tunnel: only VPN traffic goes through WireGuard
-AllowedIPs = $WG_SUBNET.0/24
+AllowedIPs = $client_allowed_ips
 PersistentKeepalive = 25
 EOF
     chmod 600 "$client_conf"
@@ -941,6 +1038,11 @@ EOF
         qrencode -t ansiutf8 < "$client_conf" || true
     fi
     log_warning "This text contains the client PRIVATE key. The server copy stays at $client_conf (root only); delete it once copied."
+    if [ "$VPN_FULL_TUNNEL" = "yes" ]; then
+        log_warning "Full tunnel is on: all IPv4 traffic from this client leaves through the server."
+        log_warning "IPv6 is not routed, so disable IPv6 on the client (or accept that IPv6 sites bypass the tunnel)."
+        log_warning "The client keeps its own DNS servers; set 'DNS = ...' in the config if you want different ones."
+    fi
 
     log_info "Waiting up to 2 minutes for the first handshake from your client..."
     until [ "$(wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null | awk '$2 != 0 {found = 1} END {print found + 0}')" = "1" ]; do
@@ -975,6 +1077,8 @@ configure_vpn() {
     mkdir -p "$(dirname "$VPN_ENGINE_STATE_FILE")"
     printf '%s\n' "$VPN_ENGINE" > "$VPN_ENGINE_STATE_FILE"
     chmod 644 "$VPN_ENGINE_STATE_FILE"
+    printf '%s\n' "$VPN_FULL_TUNNEL" > "$VPN_FULL_TUNNEL_STATE_FILE"
+    chmod 644 "$VPN_FULL_TUNNEL_STATE_FILE"
 }
 
 prepare_ssh_host_keys() {
@@ -1281,6 +1385,11 @@ configure_ufw_firewall() {
     # Self-hosted WireGuard needs its UDP port reachable from the internet.
     if [ "$VPN_ENGINE" = "wireguard" ]; then
         ufw allow "$WG_PORT"/udp comment 'WireGuard VPN'
+
+        # Full tunnel: forwarded client traffic is denied by default.
+        if [ "$VPN_FULL_TUNNEL" = "yes" ] && [ -n "$VPN_EGRESS_INTERFACE" ]; then
+            ufw route allow in on "$WG_INTERFACE" out on "$VPN_EGRESS_INTERFACE" comment 'VPN full tunnel'
+        fi
     fi
     
     # Open the SSH port only on the VPN interface
@@ -2421,6 +2530,9 @@ fi
 
 echo -e "\n${YELLOW}8. Admin VPN (only path for SSH):${NC}"
 vpn="$(cat /var/lib/server-setup/vpn-engine 2>/dev/null || echo tailscale)"
+if [ "$(cat /var/lib/server-setup/vpn-full-tunnel 2>/dev/null)" = "yes" ]; then
+    echo "Full tunnel: on (client internet traffic exits from this server)"
+fi
 if [ "$vpn" = "wireguard" ]; then
     if ip link show wg0 >/dev/null 2>&1; then
         echo "WireGuard wg0 is up: $(ip -4 -o addr show wg0 2>/dev/null | awk '{print $4}')"
@@ -2632,6 +2744,9 @@ main() {
     printf " - Provider firewall:          ${CYAN}%s${NC}\n" "$PROVIDER_FIREWALL_STATUS"
     printf " - Container engine:           ${CYAN}%s${NC}\n" "$CONTAINER_ENGINE"
     printf " - Admin VPN:                  ${CYAN}%s on %s${NC}\n" "$VPN_ENGINE" "$VPN_INTERFACE"
+    if [ "$VPN_FULL_TUNNEL" = "yes" ]; then
+        printf " - Full tunnel:                ${CYAN}on, client traffic exits via %s${NC}\n" "${VPN_EGRESS_INTERFACE:-this server}"
+    fi
     printf "${GREEN}======================================================================${NC}\n\n"
 }
 

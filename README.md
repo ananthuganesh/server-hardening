@@ -36,6 +36,7 @@ The scripts are **provider-neutral**: they work on any VPS or cloud server runni
 **Access**
 - SSH only over your **admin VPN**, on a port you choose: **Tailscale** (default) or **self-hosted WireGuard**. Key-only login with an **Ed25519 key generated on the server**, and root login disabled.
 - With Tailscale, **Tailscale SSH** as a separate emergency login path, limited to non-root users by your tailnet policy.
+- Optional **full tunnel**, so the server also works as your personal VPN gateway for browsing.
 - A **10-minute automatic rollback** while you test the new SSH connection, so a mistake can't lock you out.
 
 **Network protection**
@@ -199,6 +200,7 @@ It asks, in this order:
 | SSH port | Press Enter for `2743`, or type another port (1024–65535) |
 | Container engine | Press Enter for `docker`, or type `podman` for rootless containers ([comparison](#containers-docker-or-podman)) |
 | Admin VPN | Press Enter for `tailscale`, or type `wireguard` for a self-hosted VPN ([comparison](#admin-vpn-tailscale-or-wireguard)) |
+| Full tunnel | `y` routes **all** internet traffic from your devices through this server; `N` keeps the VPN for reaching the server only ([details](#full-tunnel-use-the-server-as-your-vpn-gateway)) |
 | Tailscale auth key (Tailscale only) | Paste a key to skip the browser, or press Enter and open the login link it prints |
 | Tailscale key expiry (Tailscale only) | In the Tailscale admin console, open **Machines**, select this server, and choose **Disable key expiry**. Then press Enter |
 | WireGuard endpoint (WireGuard only) | Press Enter to accept the detected public address, or type a hostname. The script then prints a client config, waits for your client to connect, and refuses to continue without a handshake |
@@ -269,6 +271,7 @@ Choose **Tailscale** if you want the easiest recovery. Choose **WireGuard** if y
 - `--accept-routes=false` stops a subnet route elsewhere in your tailnet from hijacking the server's own network.
 - **Key expiry:** node keys expire after 180 days by default, and an expired key would cut off SSH. The script asks you to disable expiry, and `check-health.sh` keeps reporting it.
 - A **tagged** server gets a warning, because tagged devices don't match the default Tailscale SSH rule.
+- **Exit node:** answering yes to the full-tunnel question runs `tailscale set --advertise-exit-node`; approve it in the admin console and select it per device.
 
 #### Tailscale auth keys
 
@@ -334,6 +337,30 @@ The first command prints the public key, the second adds the peer live, and the 
 
 > [!WARNING]
 > With WireGuard there is no Tailscale SSH fallback. Keep the provider console working, and don't delete your client config.
+
+#### Full tunnel: use the server as your VPN gateway
+
+By default the VPN only carries traffic to the server itself (a split tunnel), so your normal browsing is untouched. Answer `y` to the full-tunnel question and the server becomes your **personal VPN gateway**: your devices send all internet traffic through it, which is what you want on public Wi-Fi or to leave from a fixed IP address.
+
+| | Split tunnel (default) | Full tunnel |
+|---|---|---|
+| Client routes | Only the VPN subnet | Everything (`0.0.0.0/0`) |
+| Your public IP while connected | Your own | The server's |
+| Server bandwidth used | Almost none | All of your traffic |
+
+**With WireGuard**, setup then:
+- enables IPv4 forwarding in `/etc/sysctl.d/61-vpn-forward.conf`;
+- adds a NAT rule for `10.66.66.0/24` in a marked block in `/etc/ufw/before.rules`, which deliberately avoids declaring the `POSTROUTING` chain so a firewall reload can't wipe Docker's own NAT rules;
+- allows the forwarded traffic with `ufw route allow in on wg0 out on <your interface>`;
+- writes `AllowedIPs = 0.0.0.0/0` in the client config.
+
+**With Tailscale**, setup runs `tailscale set --advertise-exit-node`. You then **approve it** in the admin console (**Machines → this server → Edit route settings**) and pick it as your exit node on each device.
+
+Two things to know:
+- **IPv6 is not routed.** Turn IPv6 off on the client, or accept that IPv6-capable sites bypass the tunnel. (This applies to the WireGuard path; Tailscale exit nodes handle IPv6 themselves.)
+- **DNS stays as the client has it.** Queries travel through the tunnel, but to whichever resolver the device already uses. Add a `DNS = ...` line to the client config to change that.
+
+To switch later, rerun Phase 2 and answer the question differently, then re-import the client config.
 
 ### SSH
 
@@ -708,7 +735,7 @@ The health check reports:
 - CrowdSec bans and recent failed SSH logins;
 - Caddy status;
 - automatic update runs;
-- VPN status: Tailscale connection and key expiry, or WireGuard peer handshakes;
+- VPN status: Tailscale connection and key expiry, or WireGuard peer handshakes, plus whether the full tunnel is on;
 - whether a reboot is needed;
 - the Lynis score;
 - the provider firewall status.
@@ -806,6 +833,7 @@ If you can't reach the server over Tailscale, log in through your **provider's e
 ## Security notes and limitations
 
 - **With Tailscale, your Tailscale login is as powerful as the SSH key**, because it grants Tailscale SSH access. Protect it with two-factor login and keep check mode on.
+- **With a full tunnel, all your device traffic passes through the server**, so its provider sees it, its bandwidth carries it, and websites see its IP. Datacenter IP addresses are sometimes rate-limited or blocked.
 - **With WireGuard, there is no second way in.** If the tunnel breaks or you lose the client config, the provider console is your only route. You also manage keys by hand, and one public UDP port stays open.
 - **With Docker, the `docker` group is root-equivalent.** The admin user is a member. Protect the SSH key with a passphrase, remove the user from the group (`sudo gpasswd -d ADMIN docker`) and use `sudo docker`, or choose rootless Podman instead.
 - **Reboots are manual.** Kernel fixes only apply after a reboot.
