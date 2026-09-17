@@ -1,7 +1,7 @@
 # Debian 13 Server Setup & Hardening
 
 Two interactive Bash scripts that turn a fresh **Debian 13 (Trixie)** server into a hardened, production-ready host. They take you from a new server to this, with safety checks at every step that could lock you out:
-- SSH reachable only through Tailscale;
+- SSH reachable only through a VPN: Tailscale, or your own self-hosted WireGuard;
 - a firewall, intrusion prevention, kernel and audit hardening;
 - automatic updates;
 - the Caddy web server, and Docker or rootless Podman.
@@ -34,8 +34,8 @@ The scripts are **provider-neutral**: they work on any VPS or cloud server runni
 ## Features
 
 **Access**
-- SSH only over **Tailscale**, on a port you choose. It uses key-only login with an **Ed25519 key generated on the server**, and root login is disabled.
-- **Tailscale SSH** as a separate emergency login path, limited to non-root users by your tailnet policy.
+- SSH only over your **admin VPN**, on a port you choose: **Tailscale** (default) or **self-hosted WireGuard**. Key-only login with an **Ed25519 key generated on the server**, and root login disabled.
+- With Tailscale, **Tailscale SSH** as a separate emergency login path, limited to non-root users by your tailnet policy.
 - A **10-minute automatic rollback** while you test the new SSH connection, so a mistake can't lock you out.
 
 **Network protection**
@@ -85,9 +85,9 @@ Internet
    ├─ Caddy       automatic HTTPS, HTTP/3, your sites in /etc/caddy/sites/
    └─ Containers  Docker (published on 127.0.0.1 by default) or rootless Podman
 
-Tailscale (100.x.x.x)
+Admin VPN (Tailscale 100.x.x.x, or WireGuard 10.66.66.0/24)
    ├─ SSH on your chosen port  → admin login with the .pem key
-   └─ Tailscale SSH on port 22 → emergency login, non-root users only
+   └─ Tailscale SSH on port 22 → emergency login, non-root users only (Tailscale only)
 
 Every night at 03:30 → automatic updates
 ```
@@ -98,7 +98,8 @@ Every night at 03:30 → automatic updates
 
 - A **fresh Debian 13 server** from any provider. The scripts refuse other operating systems, and other Debian releases need a confirmation.
 - **Root access**, or a default user with `sudo`.
-- A **Tailscale account**, with Tailscale installed and logged in **on your own computer**.
+- For the **Tailscale** VPN: an account, with Tailscale installed and logged in **on your own computer**.
+- For **self-hosted WireGuard**: a WireGuard client on your computer, and the ability to open one **public UDP port** for the server.
 - A **working emergency console** at your provider (web, VNC or serial console). Some providers require you to enable it first.
 - **Optional:**
   - a [Tailscale auth key](#tailscale-auth-keys), to skip the browser login;
@@ -197,8 +198,10 @@ It asks, in this order:
 |---|---|
 | SSH port | Press Enter for `2743`, or type another port (1024–65535) |
 | Container engine | Press Enter for `docker`, or type `podman` for rootless containers ([comparison](#containers-docker-or-podman)) |
-| Tailscale auth key | Paste a key to skip the browser, or press Enter and open the login link it prints |
-| Tailscale key expiry | In the Tailscale admin console, open **Machines**, select this server, and choose **Disable key expiry**. Then press Enter |
+| Admin VPN | Press Enter for `tailscale`, or type `wireguard` for a self-hosted VPN ([comparison](#admin-vpn-tailscale-or-wireguard)) |
+| Tailscale auth key (Tailscale only) | Paste a key to skip the browser, or press Enter and open the login link it prints |
+| Tailscale key expiry (Tailscale only) | In the Tailscale admin console, open **Machines**, select this server, and choose **Disable key expiry**. Then press Enter |
+| WireGuard endpoint (WireGuard only) | Press Enter to accept the detected public address, or type a hostname. The script then prints a client config, waits for your client to connect, and refuses to continue without a handshake |
 | **SSH verification** | Keep this terminal open. From a **new terminal**, run the command it shows: `ssh -i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes -p SSH_PORT ADMIN@TAILSCALE_IP`. If it works, type `yes`. If not, type `no` to roll back |
 | CrowdSec enrollment key | Optional; press Enter to skip |
 | Provider firewall | Set the rules it prints in your provider's firewall, then type `done`. Or type `not` (not yet) or `skip` (your provider has no firewall) |
@@ -244,7 +247,22 @@ Phase 2 ends with a Lynis security audit and a summary of how to reach the serve
 - **Hostname:** on cloud-init images, `/etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg` keeps it across reboots.
 - **Swap:** `/swapfile` sized to RAM (2 GB up to 2 GB of RAM, equal to RAM up to 8 GB, capped at 8 GB), with `vm.swappiness = 10` and `vm.vfs_cache_pressure = 50`.
 
-### Tailscale
+### Admin VPN: Tailscale or WireGuard
+
+Phase 2 asks which VPN carries admin SSH. Both use the WireGuard protocol; they differ in who manages keys and whether a second way in exists.
+
+| | Tailscale (default) | Self-hosted WireGuard |
+|---|---|---|
+| Keys and devices | Managed for you; add a device by logging in | You generate keys and add each peer by hand |
+| Public ports | None needed | One **public UDP port** (default 51820) |
+| Behind NAT | Works anywhere | The server needs a reachable address |
+| Access control | Tailnet policy, device approval, key expiry | Whoever holds a key gets in |
+| Second way in | **Tailscale SSH** on port 22 | None: the provider console is the only fallback |
+| Dependency | Tailscale's coordination service | Nothing outside your server |
+
+Choose **Tailscale** if you want the easiest recovery. Choose **WireGuard** if you want no third-party service at all. The choice is saved in `/var/lib/server-setup/vpn-engine`, which the health check reads.
+
+#### Tailscale
 
 - Installed from Tailscale's official repository and logged in with `--ssh --accept-dns=true --accept-routes=false`.
 - **Setup stops if Tailscale isn't active within 2 minutes**, before SSH is touched.
@@ -290,6 +308,32 @@ In the Tailscale admin console, open **Access controls** and make the `ssh` rule
 - **Check mode:** `"check"` asks you to re-confirm in the browser periodically.
 - **Tagged servers:** use `"dst": ["tag:your-tag"]` instead of `autogroup:self`.
 - **Protect your Tailscale login:** turn on two-factor login for the account you sign into Tailscale with, since that login now grants shell access.
+
+#### Self-hosted WireGuard
+
+- **Packages:** `wireguard-tools` and `qrencode`. The kernel module ships with Debian.
+- **Addresses:** the server takes `10.66.66.1/24`, and your first client `10.66.66.2`. SSH then listens on `wg0` only.
+- **Files** (all root-only, in `/etc/wireguard/`): `server.key`, `wg0.conf`, and `clients/ADMIN-HOST.conf` with its key.
+- **Client config:** printed once during setup, with a QR code for phone apps. It's a **split tunnel**: only VPN traffic goes through WireGuard, so your normal internet is untouched.
+- **Connection check:** setup waits up to 2 minutes for your client's first handshake and refuses to harden SSH without one. That check is what prevents a lockout, since WireGuard has no second way in.
+- **Reruns keep `wg0.conf`,** so peers you added by hand survive. The admin peer is added only if missing.
+- **Provider firewall:** UDP 51820 must be open, unlike Tailscale which needs no inbound rule.
+
+Add another device (for example a phone) as `10.66.66.3`:
+
+```bash
+wg genkey | sudo tee /etc/wireguard/clients/phone.key | wg pubkey
+```
+```bash
+sudo wg set wg0 peer PUBLIC_KEY_FROM_ABOVE allowed-ips 10.66.66.3/32
+```
+```bash
+sudo wg-quick save wg0
+```
+The first command prints the public key, the second adds the peer live, and the third writes it into `wg0.conf`. Then build that device's config from the printed template, using its own private key and `Address = 10.66.66.3/32`.
+
+> [!WARNING]
+> With WireGuard there is no Tailscale SSH fallback. Keep the provider console working, and don't delete your client config.
 
 ### SSH
 
@@ -384,6 +428,7 @@ ufw allow in on tailscale0 to any port SSH_PORT proto tcp comment 'SSH via Tails
 | Allow TCP 443 from `0.0.0.0/0` and `::/0` | HTTPS |
 | Allow UDP 443 from `0.0.0.0/0` and `::/0` | HTTP/3 (optional; browsers fall back to TCP) |
 | Allow UDP 41641 from `0.0.0.0/0` and `::/0` | Optional: direct Tailscale connections instead of relays |
+| Allow UDP 51820 from `0.0.0.0/0` and `::/0` | **Required with WireGuard**; not needed with Tailscale |
 | **Remove TCP 22, and add no SSH rule** | SSH travels inside Tailscale |
 | Allow all outbound | Tailscale, updates, CrowdSec, Docker |
 
@@ -663,7 +708,7 @@ The health check reports:
 - CrowdSec bans and recent failed SSH logins;
 - Caddy status;
 - automatic update runs;
-- Tailscale status and key expiry;
+- VPN status: Tailscale connection and key expiry, or WireGuard peer handshakes;
 - whether a reboot is needed;
 - the Lynis score;
 - the provider firewall status.
@@ -705,6 +750,8 @@ sudo lynis audit system --quick
 |---|---|---|
 | SSH port | `2743` | Prompted in Phase 2 (`DEFAULT_SSH_PORT` in `setup.sh`) |
 | Container engine | `docker` | Prompted in Phase 2 (`DEFAULT_CONTAINER_ENGINE` in `setup.sh`) |
+| Admin VPN | `tailscale` | Prompted in Phase 2 (`DEFAULT_VPN_ENGINE` in `setup.sh`) |
+| WireGuard port and subnet | `51820`, `10.66.66.0/24` | `WG_PORT` and `WG_SUBNET` in `setup.sh` |
 | Timezone | `Asia/Kolkata` | `TIMEZONE_VAL` in `bootstrap.sh` |
 | Local key folder in printed commands | `~/keys` | `LOCAL_KEY_DIR` in `bootstrap.sh` |
 | Update window | 03:30 | `/etc/systemd/system/apt-daily-upgrade.timer.d/override.conf` on the server |
@@ -724,6 +771,7 @@ Both scripts are safe to run again.
 - **`setup.sh`:**
   - SSH port, auth key and firewall prompts: on a rerun, pressing Enter at the port prompt keeps the current port, and there's no auth-key prompt if Tailscale is already logged in. The provider firewall question isn't asked again once answered `done` or `skip`.
   - Existing admins stay in `AllowUsers`.
+  - Switching VPN: the new one is configured, but the old one is left installed. An existing `wg0.conf` is never overwritten.
   - Switching container engine: the new engine is installed, but the old one is left in place. Remove it yourself once the new one works, since both compete for published ports.
   - Changing the SSH port closes the old port's firewall rule.
 
@@ -743,6 +791,8 @@ If you can't reach the server over Tailscale, log in through your **provider's e
 | `Permission denied (publickey)` | Use `-i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes`. With several keys in your SSH agent, the server's limit of 3 attempts runs out before the right key |
 | `setlocale: cannot change locale` | Run `sudo localedef -i en_US -f UTF-8 en_US.UTF-8`, then log in again |
 | Tailscale logged out or key expired | Run `tailscale up --ssh --accept-dns=true --accept-routes=false`, open the link, then disable key expiry |
+| WireGuard tunnel down | Run `systemctl restart wg-quick@wg0`, then check `wg show` |
+| WireGuard never connects | Check that the provider firewall allows UDP 51820, that the client's `Endpoint` address is right, and that its key matches a peer in `wg0.conf` |
 | Banned by CrowdSec | Run `cscli decisions list`, then `cscli decisions delete --ip YOUR_IP` |
 | Firewall blocks you | Run `ufw disable`, fix the rules, then `ufw enable` |
 | Undo the last SSH change | Run `cp /etc/ssh/sshd_config.pre-run /etc/ssh/sshd_config && systemctl restart ssh`. The original distro config is in `sshd_config.bak` |
@@ -755,7 +805,8 @@ If you can't reach the server over Tailscale, log in through your **provider's e
 
 ## Security notes and limitations
 
-- **Your Tailscale login is as powerful as the SSH key**, because it grants Tailscale SSH access. Protect it with two-factor login and keep check mode on.
+- **With Tailscale, your Tailscale login is as powerful as the SSH key**, because it grants Tailscale SSH access. Protect it with two-factor login and keep check mode on.
+- **With WireGuard, there is no second way in.** If the tunnel breaks or you lose the client config, the provider console is your only route. You also manage keys by hand, and one public UDP port stays open.
 - **With Docker, the `docker` group is root-equivalent.** The admin user is a member. Protect the SSH key with a passphrase, remove the user from the group (`sudo gpasswd -d ADMIN docker`) and use `sudo docker`, or choose rootless Podman instead.
 - **Reboots are manual.** Kernel fixes only apply after a reboot.
 - **Not included:**

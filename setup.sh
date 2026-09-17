@@ -38,6 +38,17 @@ PROVIDER_FIREWALL_STATUS=""
 DEFAULT_CONTAINER_ENGINE="docker"
 CONTAINER_ENGINE=""
 CONTAINER_ENGINE_STATE_FILE="/var/lib/server-setup/container-engine"
+# tailscale or wireguard, chosen in verify_environment; read back by check-health.sh
+DEFAULT_VPN_ENGINE="tailscale"
+VPN_ENGINE=""
+VPN_INTERFACE=""
+VPN_ADMIN_IP=""
+VPN_ENGINE_STATE_FILE="/var/lib/server-setup/vpn-engine"
+# WireGuard tunables (self-hosted VPN path)
+WG_INTERFACE="wg0"
+WG_PORT="51820"
+WG_SUBNET="10.66.66"
+WG_CONFIG_DIR="/etc/wireguard"
 HOSTNAME_VAL=""
 LYNIS_TARGET_SCORE=83
 SSH_ROLLBACK_UNIT="ssh-hardening-rollback"
@@ -328,6 +339,31 @@ prompt_ssh_port() {
     log_info "SSH will listen on port $TARGET_PORT (Tailscale only)."
 }
 
+# Tailscale or self-hosted WireGuard. Both use the WireGuard protocol; they
+# differ in who manages keys and whether a second way in exists.
+prompt_vpn_engine() {
+    local vpn_input
+    local default_vpn="$DEFAULT_VPN_ENGINE"
+
+    if [ -f "$WG_CONFIG_DIR/$WG_INTERFACE.conf" ] && ! command -v tailscale >/dev/null 2>&1; then
+        default_vpn="wireguard"
+    fi
+
+    printf "\n"
+    log_info "Admin VPN (SSH is reachable only through it):"
+    printf "  tailscale  Managed keys and NAT traversal, no public VPN port, plus Tailscale SSH as a second way in.\n"
+    printf "  wireguard  Fully self-hosted. You manage keys, a public UDP port is required, and the provider console is the only fallback.\n"
+    while true; do
+        read -r -p "Which VPN? [tailscale/wireguard] ($default_vpn): " vpn_input
+        VPN_ENGINE="$(printf '%s' "${vpn_input:-$default_vpn}" | tr '[:upper:]' '[:lower:]')"
+        case "$VPN_ENGINE" in
+            tailscale|wireguard) break ;;
+            *) log_error "Please type tailscale or wireguard." ;;
+        esac
+    done
+    log_info "Admin VPN: $VPN_ENGINE"
+}
+
 # Docker or rootless Podman. Docker is the default because Compose and most
 # tooling assume it. Rootless Podman has no root-equivalent group, and its
 # published ports stay subject to UFW.
@@ -387,6 +423,7 @@ verify_environment() {
     ensure_admin_password
     prompt_ssh_port
     prompt_container_engine
+    prompt_vpn_engine
 
     # Hostname and timezone are set in bootstrap.sh (Phase 1); Phase 2 only reads them.
     HOSTNAME_VAL="$(hostname -s)"
@@ -763,6 +800,180 @@ check_tailscale_key_expiry() {
     fi
 }
 
+# Adds the admin's client as a peer without touching peers added later by hand.
+wg_add_peer_if_missing() {
+    local client_pub="$1"
+    local client_ip="$2"
+    local client_name="$3"
+    local config="$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+
+    if grep -qF "$client_pub" "$config"; then
+        log_info "Peer '$client_name' is already in $config."
+        return 0
+    fi
+
+    cat >> "$config" << EOF
+
+# $client_name
+[Peer]
+PublicKey = $client_pub
+AllowedIPs = $client_ip/32
+EOF
+    log_success "Peer '$client_name' added to $config."
+}
+
+# 4b. Self-hosted WireGuard (alternative to Tailscale)
+configure_wireguard() {
+    printf "\n=== 3. WireGuard VPN Setup ===\n"
+
+    local config="$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+    local server_key
+    local server_pub
+    local client_key
+    local client_pub
+    local client_name="$TARGET_USER-$HOSTNAME_VAL"
+    local client_conf
+    local client_key_file
+    local endpoint_input
+    local endpoint="$SERVER_PUBLIC_IP"
+    local answer
+    local waited=0
+
+    log_info "Installing WireGuard..."
+    apt-get install -y wireguard-tools qrencode
+
+    umask 077
+    mkdir -p "$WG_CONFIG_DIR/clients"
+    chmod 700 "$WG_CONFIG_DIR" "$WG_CONFIG_DIR/clients"
+
+    if [ ! -f "$WG_CONFIG_DIR/server.key" ]; then
+        log_info "Generating the WireGuard server key..."
+        wg genkey > "$WG_CONFIG_DIR/server.key"
+    fi
+    chmod 600 "$WG_CONFIG_DIR/server.key"
+    server_key="$(cat "$WG_CONFIG_DIR/server.key")"
+    server_pub="$(wg pubkey <<< "$server_key")"
+
+    client_key_file="$WG_CONFIG_DIR/clients/$client_name.key"
+    client_conf="$WG_CONFIG_DIR/clients/$client_name.conf"
+    if [ ! -f "$client_key_file" ]; then
+        log_info "Generating a WireGuard key for client '$client_name'..."
+        wg genkey > "$client_key_file"
+    fi
+    chmod 600 "$client_key_file"
+    client_key="$(cat "$client_key_file")"
+    client_pub="$(wg pubkey <<< "$client_key")"
+
+    # Clients need a reachable address for the tunnel endpoint.
+    detect_public_ip
+    endpoint="$SERVER_PUBLIC_IP"
+    read -r -p "Public address clients connect to [$endpoint]: " endpoint_input
+    endpoint="${endpoint_input:-$endpoint}"
+    if [ -z "$endpoint" ] || [ "$endpoint" = "YOUR_SERVER_PUBLIC_IP" ]; then
+        log_error "A public address or hostname is required for the WireGuard endpoint."
+        exit 1
+    fi
+
+    # Reruns keep an existing config so hand-added peers survive.
+    if [ -f "$config" ]; then
+        log_info "Keeping the existing $config (peers added by hand are preserved)."
+    else
+        log_info "Writing $config..."
+        cat > "$config" << EOF
+# Managed by setup.sh. Add more peers with wg genkey / [Peer] blocks below.
+[Interface]
+Address = $WG_SUBNET.1/24
+ListenPort = $WG_PORT
+PrivateKey = $server_key
+EOF
+    fi
+    chmod 600 "$config"
+    wg_add_peer_if_missing "$client_pub" "$WG_SUBNET.2" "$client_name"
+
+    log_info "Writing the client configuration $client_conf..."
+    cat > "$client_conf" << EOF
+[Interface]
+# Client: $client_name
+PrivateKey = $client_key
+Address = $WG_SUBNET.2/32
+
+[Peer]
+PublicKey = $server_pub
+Endpoint = $endpoint:$WG_PORT
+# Split tunnel: only VPN traffic goes through WireGuard
+AllowedIPs = $WG_SUBNET.0/24
+PersistentKeepalive = 25
+EOF
+    chmod 600 "$client_conf"
+
+    log_info "Starting WireGuard..."
+    systemctl enable "wg-quick@$WG_INTERFACE"
+    systemctl restart "wg-quick@$WG_INTERFACE"
+    if ! ip link show "$WG_INTERFACE" &>/dev/null; then
+        log_error "Interface $WG_INTERFACE did not come up. Check: journalctl -u wg-quick@$WG_INTERFACE"
+        exit 1
+    fi
+
+    # UFW may already be active from an earlier run; the handshake needs the port.
+    if command -v ufw >/dev/null 2>&1 && grep -q '^Status: active' <<< "$(ufw status 2>/dev/null || true)"; then
+        ufw allow "$WG_PORT"/udp comment 'WireGuard' >/dev/null 2>&1 || true
+    fi
+
+    VPN_INTERFACE="$WG_INTERFACE"
+    VPN_ADMIN_IP="$WG_SUBNET.1"
+
+    log_warning "======================================================================"
+    log_warning "                  SET UP YOUR WIREGUARD CLIENT NOW                    "
+    log_warning "======================================================================"
+    log_warning "1. Open UDP port $WG_PORT for this server in your provider firewall."
+    log_warning "2. Save the configuration below on your computer as $client_name.conf,"
+    log_warning "   then import it into the WireGuard app (or 'wg-quick up' on Linux/macOS)."
+    log_warning "3. Connect, then check that this works: ping $VPN_ADMIN_IP"
+    log_warning "======================================================================"
+    printf "\n"
+    cat "$client_conf"
+    printf "\n"
+    if command -v qrencode >/dev/null 2>&1; then
+        log_info "Same configuration as a QR code for phone apps:"
+        qrencode -t ansiutf8 < "$client_conf" || true
+    fi
+    log_warning "This text contains the client PRIVATE key. The server copy stays at $client_conf (root only); delete it once copied."
+
+    log_info "Waiting up to 2 minutes for the first handshake from your client..."
+    until [ "$(wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null | awk '$2 != 0 {found = 1} END {print found + 0}')" = "1" ]; do
+        if [ "$waited" -ge 120 ]; then
+            log_warning "No WireGuard handshake yet. Without a working client you cannot reach SSH after hardening."
+            read -r -p "Continue anyway? (y/N): " answer
+            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                log_error "Stopped before touching SSH. Fix the client or the provider firewall, then rerun."
+                exit 1
+            fi
+            break
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        log_info "Still waiting for a handshake (${waited}s/120s)..."
+    done
+    if [ "$waited" -lt 120 ]; then
+        log_success "WireGuard handshake received; the client is connected."
+    fi
+}
+
+# Installs and configures the chosen admin VPN, and records it for check-health.sh.
+configure_vpn() {
+    if [ "$VPN_ENGINE" = "wireguard" ]; then
+        configure_wireguard
+    else
+        install_tailscale
+        VPN_INTERFACE="tailscale0"
+        VPN_ADMIN_IP="$TAILSCALE_IP"
+    fi
+
+    mkdir -p "$(dirname "$VPN_ENGINE_STATE_FILE")"
+    printf '%s\n' "$VPN_ENGINE" > "$VPN_ENGINE_STATE_FILE"
+    chmod 644 "$VPN_ENGINE_STATE_FILE"
+}
+
 prepare_ssh_host_keys() {
     local rsa_bits
 
@@ -796,12 +1007,11 @@ prepare_ssh_host_keys() {
 configure_ssh_hardening() {
     printf "\n=== 4. SSH Hardening ===\n"
 
-    # Pre-fetch Tailscale IP
-    local ts_ip
-    ts_ip=$(tailscale ip -4 | tr -d '[:space:]')
+    # Address on the admin VPN, set by configure_vpn
+    local vpn_ip="$VPN_ADMIN_IP"
 
-    if [ -z "$ts_ip" ]; then
-        log_error "Could not retrieve Tailscale IP. Aborting SSH hardening to avoid lockout."
+    if [ -z "$vpn_ip" ]; then
+        log_error "No admin VPN address available. Aborting SSH hardening to avoid lockout."
         exit 1
     fi
 
@@ -915,8 +1125,9 @@ EOF
 # Hardened OpenSSH Daemon Configuration (Debian 13)
 #
 # Do not bind sshd to the Tailscale IP with ListenAddress.
-# On reboot, ssh can start before tailscale0 receives its IP, which makes
-# port $TARGET_PORT refuse connections. UFW restricts this port to tailscale0.
+# On reboot, ssh can start before the VPN interface receives its IP, which
+# makes port $TARGET_PORT refuse connections. UFW restricts this port to the
+# VPN interface instead.
 #
 # sshd uses the first value it reads for each keyword, so these settings win
 # over anything in the sshd_config.d drop-ins included at the bottom.
@@ -1001,22 +1212,22 @@ EOF
     fi
     
     # Configure UFW rules BEFORE prompt to allow the user to test UFW seamlessly
-    configure_ufw_firewall "$ts_ip"
+    configure_ufw_firewall "$vpn_ip"
 
     log_warning "======================================================================"
     log_warning "                    SSH SAFETY VERIFICATION GATE                      "
     log_warning "======================================================================"
     log_warning "SSH has been moved to Port $TARGET_PORT."
-    log_warning "Firewall access is restricted to the Tailscale interface only ($ts_ip)."
+    log_warning "Firewall access is restricted to the $VPN_INTERFACE interface only ($vpn_ip)."
     log_warning "Do NOT close this current terminal session under any circumstances!"
     log_warning "Automatic rollback is armed for ${SSH_ROLLBACK_DELAY_MINUTES} minutes and will be cancelled only after you type yes."
     log_warning "ACTION REQUIRED:"
-    log_warning "1. Ensure your local computer is connected to Tailscale."
+    log_warning "1. Ensure your local computer is connected to the VPN ($VPN_ENGINE)."
     log_warning "2. Open a NEW terminal window on your local machine."
     log_warning "3. Test the hardened connection by running:"
-    log_warning "   ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$ts_ip"
+    log_warning "   ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$vpn_ip"
     log_warning "   (Use the .pem file bootstrap.sh generated. IdentitiesOnly=yes matters: MaxAuthTries is 3.)"
-    log_warning "   Your SSH client sees the Tailscale IP and port as a new host, so it will ask you to confirm the fingerprint."
+    log_warning "   Your SSH client sees the VPN address and port as a new host, so it will ask you to confirm the fingerprint."
     log_warning "======================================================================"
     
     while true; do
@@ -1044,13 +1255,13 @@ EOF
 
 # 6. UFW Firewall Setup
 configure_ufw_firewall() {
-    local ts_ip=$1
+    local vpn_ip=$1
     log_info "Installing and configuring UFW firewall..."
     apt-get install -y ufw
     
-    # Verify tailscale0 interface exists
-    if ! ip link show tailscale0 &>/dev/null; then
-        log_warning "tailscale0 network interface was not detected by the OS. Waiting 5s..."
+    # Verify the VPN interface exists
+    if ! ip link show "$VPN_INTERFACE" &>/dev/null; then
+        log_warning "$VPN_INTERFACE network interface was not detected by the OS. Waiting 5s..."
         sleep 5
     fi
     
@@ -1063,15 +1274,20 @@ configure_ufw_firewall() {
     ufw allow 80/tcp comment 'HTTP'
     ufw allow 443/tcp comment 'HTTPS'
     ufw allow 443/udp comment 'HTTP/3 (Caddy)'
+
+    # Self-hosted WireGuard needs its UDP port reachable from the internet.
+    if [ "$VPN_ENGINE" = "wireguard" ]; then
+        ufw allow "$WG_PORT"/udp comment 'WireGuard VPN'
+    fi
     
-    # Open the SSH port only on the tailscale0 interface
-    ufw allow in on tailscale0 to any port "$TARGET_PORT" proto tcp comment 'SSH via Tailscale only'
+    # Open the SSH port only on the VPN interface
+    ufw allow in on "$VPN_INTERFACE" to any port "$TARGET_PORT" proto tcp comment 'SSH via VPN only'
 
     # If the SSH port changed since the last run, close the old one. A rollback
     # restores it from the pre-run UFW snapshot.
     if [[ "$PREVIOUS_SSH_PORT" =~ ^[0-9]+$ ]] && [ "$PREVIOUS_SSH_PORT" != "22" ] && [ "$PREVIOUS_SSH_PORT" != "$TARGET_PORT" ]; then
         log_info "Closing the previous SSH port $PREVIOUS_SSH_PORT in UFW..."
-        ufw delete allow in on tailscale0 to any port "$PREVIOUS_SSH_PORT" proto tcp >/dev/null 2>&1 || true
+        ufw delete allow in on "$VPN_INTERFACE" to any port "$PREVIOUS_SSH_PORT" proto tcp >/dev/null 2>&1 || true
     fi
 
     log_info "Enabling UFW..."
@@ -1190,16 +1406,23 @@ EOF
     # CrowdSec whitelist does not cover. A few failed key attempts would ban
     # the admin's Tailscale IP, and the nftables bouncer blocks it on every
     # interface, including tailscale0: a lockout.
-    log_info "Whitelisting Tailscale addresses in CrowdSec..."
+    local vpn_cidrs
+    if [ "$VPN_ENGINE" = "wireguard" ]; then
+        vpn_cidrs="    - \"$WG_SUBNET.0/24\""
+    else
+        vpn_cidrs="    - \"100.64.0.0/10\"
+    - \"fd7a:115c:a1e0::/48\""
+    fi
+
+    log_info "Whitelisting admin VPN addresses in CrowdSec..."
     mkdir -p /etc/crowdsec/parsers/s02-enrich
-    cat << 'EOF' > /etc/crowdsec/parsers/s02-enrich/tailscale-whitelist.yaml
+    cat > /etc/crowdsec/parsers/s02-enrich/tailscale-whitelist.yaml << EOF
 name: custom/tailscale-whitelist
-description: "Never ban Tailscale addresses; admin SSH arrives from them"
+description: "Never ban admin VPN addresses; admin SSH arrives from them"
 whitelist:
-  reason: "Tailscale admin network"
+  reason: "Admin VPN network"
   cidr:
-    - "100.64.0.0/10"
-    - "fd7a:115c:a1e0::/48"
+$vpn_cidrs
 EOF
 
     # sshd logs reach CrowdSec once, through /var/log/auth.log (rsyslog). A
@@ -1235,8 +1458,12 @@ EOF
     # Lift bans on individual Tailscale IPs made before the whitelist loaded.
     # --contained matches decisions inside the range; without it only a ban on
     # the whole range itself would be deleted.
-    cscli decisions delete --range 100.64.0.0/10 --contained >/dev/null 2>&1 || true
-    cscli decisions delete --range fd7a:115c:a1e0::/48 --contained >/dev/null 2>&1 || true
+    if [ "$VPN_ENGINE" = "wireguard" ]; then
+        cscli decisions delete --range "$WG_SUBNET.0/24" --contained >/dev/null 2>&1 || true
+    else
+        cscli decisions delete --range 100.64.0.0/10 --contained >/dev/null 2>&1 || true
+        cscli decisions delete --range fd7a:115c:a1e0::/48 --contained >/dev/null 2>&1 || true
+    fi
 
     # Keep parsers and scenarios current (the package ships this timer but does
     # not always enable it).
@@ -1933,6 +2160,10 @@ COMMIT
 # END UFW AND DOCKER
 EOF
 
+    # The block above is written literally, so point the VPN RETURN rule at the
+    # interface actually in use.
+    sed -i "s|^-A DOCKER-USER -i tailscale0 -j RETURN$|-A DOCKER-USER -i $VPN_INTERFACE -j RETURN|" "$after_rules"
+
     if ufw reload; then
         log_success "Docker containers are now behind UFW. Expose one publicly with: ufw route allow proto tcp from any to any port CONTAINER_PORT"
     else
@@ -2185,8 +2416,22 @@ else
     echo "No automatic update has run yet."
 fi
 
-echo -e "\n${YELLOW}8. Tailscale (only path for SSH):${NC}"
-if tailscale status --peers=false >/dev/null 2>&1; then
+echo -e "\n${YELLOW}8. Admin VPN (only path for SSH):${NC}"
+vpn="$(cat /var/lib/server-setup/vpn-engine 2>/dev/null || echo tailscale)"
+if [ "$vpn" = "wireguard" ]; then
+    if ip link show wg0 >/dev/null 2>&1; then
+        echo "WireGuard wg0 is up: $(ip -4 -o addr show wg0 2>/dev/null | awk '{print $4}')"
+        sudo wg show wg0 latest-handshakes 2>/dev/null | while read -r peer handshake; do
+            if [ "${handshake:-0}" = "0" ]; then
+                echo -e "${RED}Peer ${peer:0:16}... has never connected.${NC}"
+            else
+                echo "Peer ${peer:0:16}... last handshake $(( ($(date +%s) - handshake) / 60 )) minute(s) ago."
+            fi
+        done
+    else
+        echo -e "${RED}WireGuard wg0 is NOT up. SSH is only reachable through the VPN.${NC}"
+    fi
+elif tailscale status --peers=false >/dev/null 2>&1; then
     echo "Tailscale is connected: $(tailscale ip -4 2>/dev/null)"
     key_expiry="$(tailscale status --json 2>/dev/null | jq -r '.Self.KeyExpiry // empty' 2>/dev/null)"
     if [ -n "$key_expiry" ]; then
@@ -2251,8 +2496,12 @@ confirm_provider_firewall() {
     printf "   ALLOW   TCP 80      from 0.0.0.0/0 and ::/0   HTTP (Caddy, HTTPS certificate issuance)\n"
     printf "   ALLOW   TCP 443     from 0.0.0.0/0 and ::/0   HTTPS\n"
     printf "   ALLOW   UDP 443     from 0.0.0.0/0 and ::/0   HTTP/3\n"
-    printf "   ALLOW   UDP 41641   from 0.0.0.0/0 and ::/0   optional: direct Tailscale connections\n"
-    printf "   REMOVE  TCP 22, and do NOT open TCP %s: SSH works only inside Tailscale\n" "$TARGET_PORT"
+    if [ "$VPN_ENGINE" = "wireguard" ]; then
+        printf "   ALLOW   UDP %-7s from 0.0.0.0/0 and ::/0   REQUIRED: WireGuard VPN\n" "$WG_PORT"
+    else
+        printf "   ALLOW   UDP 41641   from 0.0.0.0/0 and ::/0   optional: direct Tailscale connections\n"
+    fi
+    printf "   REMOVE  TCP 22, and do NOT open TCP %s: SSH works only inside the VPN\n" "$TARGET_PORT"
     printf "   OUTBOUND: allow all (Tailscale, updates, CrowdSec, Docker)\n"
     log_warning "Before removing port 22, confirm the provider's emergency console gives you a login prompt."
     log_info "No network firewall at your provider? Choose skip: UFW already enforces the same rules on this server."
@@ -2332,10 +2581,8 @@ run_lynis_audit() {
     fi
 
     if [ -f /var/run/reboot-required ]; then
-        local reboot_ts_ip
-        reboot_ts_ip=$(tailscale ip -4 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -n "$reboot_ts_ip" ]; then
-            log_warning "A reboot is required to finish applying kernel/service updates. Reconnect after reboot with: ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$reboot_ts_ip"
+        if [ -n "$VPN_ADMIN_IP" ]; then
+            log_warning "A reboot is required to finish applying kernel/service updates. Reconnect after reboot with: ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$VPN_ADMIN_IP"
         else
             log_warning "A reboot is required to finish applying kernel/service updates."
         fi
@@ -2347,7 +2594,7 @@ main() {
     verify_environment
     configure_base_system
     configure_swap
-    install_tailscale
+    configure_vpn
     configure_ssh_hardening
     lock_down_root
     configure_crowdsec
@@ -2361,8 +2608,6 @@ main() {
     run_lynis_audit
     confirm_provider_firewall
     
-    local ts_ip
-    ts_ip=$(tailscale ip -4 | tr -d '[:space:]')
     
     printf "\n${GREEN}======================================================================${NC}\n"
     printf "${GREEN}                 PHASE 2 HARDENING SUCCESSFUL                         ${NC}\n"
@@ -2370,15 +2615,20 @@ main() {
     log_success "All security policies, firewalls, and application nodes are active!"
     log_info "Operating system: $OS_PRETTY"
     log_info "Summary of active endpoints:"
-    printf " - SSH Administrative Access:  ${CYAN}ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$ts_ip${NC}\n"
+    printf " - SSH Administrative Access:  ${CYAN}ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$VPN_ADMIN_IP${NC}\n"
     printf " - HTTP Public Interface:      ${CYAN}Port 80 (Open)${NC}\n"
     printf " - HTTPS Public Interface:     ${CYAN}Port 443 TCP + UDP/HTTP3 (Open)${NC}\n"
     printf " - Web server (Caddy) sites:   ${CYAN}/etc/caddy/sites/*.caddy${NC}\n"
     printf " - Automatic updates:          ${CYAN}nightly 03:30, reboots manual (~/check-health.sh)${NC}\n"
-    printf " - Tailscale SSH policy:       ${CYAN}set \"users\": [\"autogroup:nonroot\"] in the tailnet policy${NC}\n"
+    if [ "$VPN_ENGINE" = "wireguard" ]; then
+        printf " - Emergency access:           ${CYAN}provider console only (no Tailscale SSH with WireGuard)${NC}\n"
+    else
+        printf " - Tailscale SSH policy:       ${CYAN}set \"users\": [\"autogroup:nonroot\"] in the tailnet policy${NC}\n"
+    fi
     printf " - GitHub deploy key per repo: ${CYAN}~/github-deploy-key.sh OWNER/REPO${NC}\n"
     printf " - Provider firewall:          ${CYAN}%s${NC}\n" "$PROVIDER_FIREWALL_STATUS"
     printf " - Container engine:           ${CYAN}%s${NC}\n" "$CONTAINER_ENGINE"
+    printf " - Admin VPN:                  ${CYAN}%s on %s${NC}\n" "$VPN_ENGINE" "$VPN_INTERFACE"
     printf "${GREEN}======================================================================${NC}\n\n"
 }
 
