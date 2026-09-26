@@ -36,7 +36,7 @@ PEM_OWNER="root"
 # Folder on the admin's own computer where the printed commands save the .pem.
 # Shown literally in instructions, so "~" stays unexpanded on purpose.
 LOCAL_KEY_DIR="~/keys"
-SERVER_PUBLIC_IP="YOUR_SERVER_PUBLIC_IP"
+SERVER_PUBLIC_IP=""
 OS_ID=""
 OS_VERSION_ID=""
 OS_PRETTY=""
@@ -107,9 +107,19 @@ detect_public_ip() {
 
     if [[ "$detected_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         SERVER_PUBLIC_IP="$detected_ip"
-    else
-        log_warning "Could not auto-detect public IPv4 address; final SSH command will use placeholder."
+        return 0
     fi
+
+    # Ask rather than printing a placeholder the user would copy verbatim.
+    log_warning "Could not auto-detect this server's public address."
+    while [ -z "$SERVER_PUBLIC_IP" ]; do
+        read -r -p "Enter the address you use to reach this server (IP or hostname): " detected_ip
+        if [[ "$detected_ip" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+            SERVER_PUBLIC_IP="$detected_ip"
+        else
+            log_error "Enter a valid IP address or hostname."
+        fi
+    done
 }
 
 format_ssh_host() {
@@ -520,8 +530,8 @@ if [ -n "$PEM_FILE" ] && [ -f "$PEM_FILE" ]; then
     else
         printf "%s. Download the private key (run these on your computer, not on the server):\n" "$STEP"
         printf "   ${BLUE}mkdir -p %s${NC}\n" "$LOCAL_KEY_DIR"
-        printf "   ${BLUE}scp -i %s/YOUR_CURRENT_LOGIN_KEY.pem %s%s@%s:%s %s/%s${NC}\n" "$LOCAL_KEY_DIR" "$SCP_PORT_OPT" "$PEM_OWNER" "$SSH_HOST" "$PEM_FILE" "$LOCAL_KEY_DIR" "$PEM_NAME"
-        printf "   (-i is the key you used to log in as '%s', for example your cloud provider key)\n" "$PEM_OWNER"
+        printf "   ${BLUE}scp %s%s@%s:%s %s/%s${NC}\n" "$SCP_PORT_OPT" "$PEM_OWNER" "$SSH_HOST" "$PEM_FILE" "$LOCAL_KEY_DIR" "$PEM_NAME"
+        printf "   If that asks for a password or is refused, add the key file you log in with: -i /path/to/that/key\n"
         printf "   If macOS says 'Operation not permitted', the folder is locked: ${BLUE}chflags nouchg %s${NC}\n" "$LOCAL_KEY_DIR"
     fi
     printf "   ${BLUE}chmod 600 %s/%s${NC}\n" "$LOCAL_KEY_DIR" "$PEM_NAME"

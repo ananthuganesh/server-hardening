@@ -2391,7 +2391,7 @@ fi
 repo="${1:-}"
 repo="${repo%.git}"
 if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-    echo "Usage: $0 OWNER/REPO   (for example: $0 acme/website)" >&2
+    echo "Usage: $0 OWNER/REPO" >&2
     exit 1
 fi
 
