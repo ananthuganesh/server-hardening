@@ -102,7 +102,6 @@ Every night at 03:30 → automatic updates
 - A **Tailscale account**, with Tailscale installed and logged in **on your own computer**.
 - A **working emergency console** at your provider (web, VNC or serial console). Some providers require you to enable it first.
 - **Optional:**
-  - a [Tailscale auth key](#tailscale-auth-keys), to skip the browser login;
   - a [CrowdSec console](https://app.crowdsec.net) enrollment key;
   - a domain name for HTTPS sites.
 
@@ -118,7 +117,7 @@ In the commands below, replace these placeholders:
 | `ADMIN` | The admin username you choose in Phase 1 |
 | `HOST` | The hostname you choose in Phase 1 |
 | `TAILSCALE_IP` | The server's Tailscale IP (`100.x.x.x`), shown during Phase 2 |
-| `SSH_PORT` | The SSH port you choose in Phase 2 (default `2743`) |
+| `SSH_PORT` | The SSH port you choose in Phase 2 |
 | `LOGIN_KEY` | The key you use to log in to the fresh server today, for example your provider's key pair |
 
 ### 1. Prepare
@@ -196,9 +195,8 @@ It asks, in this order:
 
 | Prompt | What to do |
 |---|---|
-| SSH port | Press Enter for `2743`, or type another port (1024–65535) |
+| SSH port | Type the port you want (1024–65535). Nothing is suggested; on a rerun, press Enter to keep the port sshd already uses |
 | Exit node | `y` lets your devices send **all** internet traffic through this server; `N` keeps Tailscale for reaching the server only ([details](#exit-node-use-the-server-as-your-vpn-gateway)) |
-| Tailscale auth key | Paste a key to skip the browser, or press Enter and open the login link it prints |
 | Tailscale key expiry | In the Tailscale admin console, open **Machines**, select this server, and choose **Disable key expiry**. Then press Enter |
 | **SSH verification** | Keep this terminal open. From a **new terminal**, run the command it shows: `ssh -i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes -p SSH_PORT ADMIN@TAILSCALE_IP`. If it works, type `yes`. If not, type `no` to roll back |
 | CrowdSec enrollment key | Optional; press Enter to skip |
@@ -253,25 +251,7 @@ Tailscale is the only admin VPN, and after Phase 2 it is the only way SSH is rea
 - **Setup stops if Tailscale isn't active within 2 minutes**, before SSH is touched.
 - `--accept-routes=false` stops a subnet route elsewhere in your tailnet from hijacking the server's own network.
 - **Key expiry:** node keys expire after 180 days by default, and an expired key would cut off SSH. The script asks you to disable expiry, and `check-health.sh` keeps reporting it.
-- A **tagged** server gets a warning, because tagged devices don't match the default Tailscale SSH rule.
 - **Exit node:** answering yes to the exit node question runs `tailscale set --advertise-exit-node`; approve it in the admin console and select it per device.
-
-#### Tailscale auth keys
-
-Every server joins your tailnet as its own device, so a new server normally needs a browser login. To skip it, create a key under **Tailscale admin console → Settings → Keys → Generate auth key**, then paste it at the prompt.
-
-- **Kept out of logs:** the key is read hidden and passed as `--auth-key=file:<root-only temporary file>`, which is shredded right after use. It never appears in the process list, shell history or audit logs.
-- **Fallback:** if Tailscale rejects the key, the script falls back to the browser login.
-
-| Key setting | Recommendation |
-|---|---|
-| Reusable | Only for setting up several servers in a row; revoke it afterwards |
-| Expiration | Short, 1–7 days |
-| Pre-approved | On, if your tailnet requires device approval |
-| Tags | Optional. Tagged servers have no key expiry, but need a matching Tailscale SSH rule (see below) |
-
-> [!CAUTION]
-> Anyone with an auth key can add devices to your tailnet. Treat it like a password and never commit it.
 
 #### Tailscale SSH: emergency path
 
@@ -282,7 +262,7 @@ In the Tailscale admin console, open **Access controls** and make the `ssh` rule
 ```json
 "ssh": [
   {
-    "action": "check",
+    "action": "accept",
     "src":    ["autogroup:member"],
     "dst":    ["autogroup:self"],
     "users":  ["autogroup:nonroot"]
@@ -291,8 +271,6 @@ In the Tailscale admin console, open **Access controls** and make the `ssh` rule
 ```
 
 - **Stricter:** `"users": ["ADMIN"]` allows only the admin user.
-- **Check mode:** `"check"` asks you to re-confirm in the browser periodically.
-- **Tagged servers:** use `"dst": ["tag:your-tag"]` instead of `autogroup:self`.
 - **Protect your Tailscale login:** turn on two-factor login for the account you sign into Tailscale with, since that login now grants shell access.
 
 #### Exit node: use the server as your VPN gateway
@@ -696,7 +674,6 @@ sudo lynis audit system --quick
 
 | Setting | Default | Where to change it |
 |---|---|---|
-| SSH port | `2743` | Prompted in Phase 2 (`DEFAULT_SSH_PORT` in `setup.sh`) |
 | Timezone | `Asia/Kolkata` | `TIMEZONE_VAL` in `bootstrap.sh` |
 | Local key folder in printed commands | `~/keys` | `LOCAL_KEY_DIR` in `bootstrap.sh` |
 | Update window | 03:30 | `/etc/systemd/system/apt-daily-upgrade.timer.d/override.conf` on the server |
@@ -714,7 +691,7 @@ Both scripts are safe to run again.
   - On a hardened server, it prints commands that use the Tailscale IP and SSH port.
   - It offers to add new admins to `AllowUsers`.
 - **`setup.sh`:**
-  - SSH port, auth key and firewall prompts: on a rerun, pressing Enter at the port prompt keeps the current port, and there's no auth-key prompt if Tailscale is already logged in. The provider firewall question isn't asked again once answered `done` or `skip`.
+  - SSH port and firewall prompts: on a rerun, pressing Enter at the port prompt keeps the current port, and Tailscale isn't asked to log in again if it's already logged in. The provider firewall question isn't asked again once answered `done` or `skip`.
   - Existing admins stay in `AllowUsers`.
   - Changing the SSH port closes the old port's firewall rule.
 
@@ -746,7 +723,7 @@ If you can't reach the server over Tailscale, log in through your **provider's e
 
 ## Security notes and limitations
 
-- **Your Tailscale login is as powerful as the SSH key**, because it grants Tailscale SSH access. Protect it with two-factor login and keep check mode on.
+- **Your Tailscale login is as powerful as the SSH key**, because it grants Tailscale SSH access. Protect it with two-factor login on your Tailscale account.
 - **With an exit node, all your device traffic passes through the server**, so its provider sees it, its bandwidth carries it, and websites see its IP. Datacenter IP addresses are sometimes rate-limited or blocked.
 - **The `docker` group is root-equivalent.** The admin user is a member, so anyone who can log in as that user can become root through Docker. Protect the SSH key with a passphrase, or remove the user from the group (`sudo gpasswd -d ADMIN docker`) and use `sudo docker`.
 - **Reboots are manual.** Kernel fixes only apply after a reboot.

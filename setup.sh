@@ -26,8 +26,7 @@ NC='\033[0m' # No Color
 # Global Variables
 TARGET_USER=""
 TARGET_HOME=""
-# SSH port is prompted in verify_environment; 2743 is only the suggested default.
-DEFAULT_SSH_PORT="2743"
+# SSH port is prompted in verify_environment; no port is suggested.
 TARGET_PORT=""
 # Port sshd used before this run (read via sshd -T), to close its old UFW rule.
 PREVIOUS_SSH_PORT=""
@@ -295,17 +294,24 @@ check_admin_ssh_keys() {
 # default is the port sshd already uses, so pressing Enter never moves SSH.
 prompt_ssh_port() {
     local port_input
-    local default_port="$DEFAULT_SSH_PORT"
+    local current_port=""
     local listener
 
     PREVIOUS_SSH_PORT="$(sshd -T 2>/dev/null | awk '$1 == "port" && !found {print $2; found = 1}' || true)"
     if [[ "$PREVIOUS_SSH_PORT" =~ ^[0-9]+$ ]] && [ "$PREVIOUS_SSH_PORT" != "22" ]; then
-        default_port="$PREVIOUS_SSH_PORT"
+        current_port="$PREVIOUS_SSH_PORT"
     fi
 
+    # No port is suggested on a first run: the admin picks their own. On a rerun
+    # the port sshd already uses is offered, so Enter keeps the working one.
     while true; do
-        read -r -p "SSH port, reachable only over Tailscale [$default_port]: " port_input
-        TARGET_PORT="${port_input:-$default_port}"
+        if [ -n "$current_port" ]; then
+            read -r -p "SSH port, reachable only over Tailscale [$current_port]: " port_input
+            TARGET_PORT="${port_input:-$current_port}"
+        else
+            read -r -p "SSH port, reachable only over Tailscale (1024-65535, for example 1234): " port_input
+            TARGET_PORT="$port_input"
+        fi
 
         # 22 is excluded by the range on purpose: Tailscale SSH already answers on
         # port 22 of the Tailscale IP, so sshd would be unreachable there.
@@ -461,7 +467,7 @@ EOF
     log_info "Updating apt packages & installing baseline requirements..."
     apt-get update && apt-get upgrade -y && apt-get autoremove -y
 
-    # Correct time is required for HTTPS certificates, Tailscale check mode and
+    # Correct time is required for HTTPS certificates, authentication and
     # usable logs. Minimal images sometimes ship without a time sync service.
     if [ "$(timedatectl show -p NTP --value 2>/dev/null || true)" != "yes" ]; then
         log_info "Enabling NTP time synchronization..."
@@ -634,7 +640,7 @@ install_tailscale() {
             log_error "tailscale set failed. Check: tailscale status"
             exit 1
         fi
-    elif ! tailscale_login_with_auth_key; then
+    else
         log_warning "Please authenticate the server in the browser link printed below:"
         if ! tailscale up --ssh --accept-dns=true --accept-routes=false; then
             log_error "tailscale up command failed! Please verify if tailscaled daemon is active."
@@ -669,70 +675,12 @@ install_tailscale() {
         fi
     fi
 
-    warn_if_tailscale_tagged
     check_tailscale_key_expiry
     remind_tailscale_ssh_policy
 
     mkdir -p "$(dirname "$VPN_FULL_TUNNEL_STATE_FILE")"
     printf '%s\n' "$VPN_FULL_TUNNEL" > "$VPN_FULL_TUNNEL_STATE_FILE"
     chmod 644 "$VPN_FULL_TUNNEL_STATE_FILE"
-}
-
-# Optional login with a Tailscale auth key, so a new server needs no browser.
-# Returns 0 when logged in with the key, 1 to fall back to the browser login.
-# The key is read hidden and handed over as --auth-key=file:..., so it never
-# appears in the process list, shell history or the auditd execve log, and the
-# temporary file is shredded right after use.
-tailscale_login_with_auth_key() {
-    local auth_key=""
-    local auth_key_file
-    local login_ok=1
-
-    log_info "To skip the browser login, paste a Tailscale auth key (admin console -> Settings -> Keys -> Generate auth key)."
-    while true; do
-        read -r -s -p "Tailscale auth key (input hidden; leave empty to log in via browser): " auth_key
-        printf "\n"
-        if [ -z "$auth_key" ]; then
-            return 1
-        fi
-        if [[ "$auth_key" =~ ^tskey-[A-Za-z0-9-]+$ ]]; then
-            break
-        fi
-        log_error "That doesn't look like a Tailscale auth key (it starts with tskey-). Try again, or leave it empty."
-    done
-
-    auth_key_file="$(mktemp /root/.tailscale-authkey.XXXXXX)"
-    chmod 600 "$auth_key_file"
-    # Remove the key file even if the script is interrupted during login.
-    trap "shred -u '$auth_key_file' 2>/dev/null || rm -f '$auth_key_file'" EXIT
-    printf '%s' "$auth_key" > "$auth_key_file"
-    auth_key=""
-
-    log_info "Logging in to Tailscale with the auth key..."
-    if tailscale up --ssh --accept-dns=true --accept-routes=false --auth-key="file:$auth_key_file"; then
-        log_success "Tailscale login with auth key succeeded."
-        login_ok=0
-    else
-        log_warning "Tailscale rejected the auth key (expired, already used or revoked). Falling back to browser login."
-    fi
-
-    shred -u "$auth_key_file" 2>/dev/null || rm -f "$auth_key_file"
-    trap - EXIT
-    return "$login_ok"
-}
-
-# Tagged auth keys make the server a tagged device. Those have no key expiry,
-# but they also stop matching the default Tailscale SSH rule
-# ("dst": ["autogroup:self"]), which would silently remove the emergency path.
-warn_if_tailscale_tagged() {
-    local tags
-
-    tags="$(tailscale status --json 2>/dev/null | jq -r '(.Self.Tags // []) | join(", ")' 2>/dev/null || true)"
-    if [ -n "$tags" ]; then
-        log_warning "This server joined Tailscale with tags: $tags"
-        log_warning "Tagged servers do not match the default Tailscale SSH rule (\"dst\": [\"autogroup:self\"])."
-        log_warning "For the emergency Tailscale SSH path, add an ssh rule with \"dst\": [the tag] and \"users\": [\"autogroup:nonroot\"]."
-    fi
 }
 
 # --ssh keeps Tailscale SSH on port 22 of the Tailscale IP as an emergency path
