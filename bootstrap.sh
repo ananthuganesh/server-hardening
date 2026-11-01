@@ -27,7 +27,7 @@ TARGET_USER=""
 HOSTNAME_VAL=""
 TIMEZONE_VAL="Asia/Kolkata"
 SSH_PORT="22"
-SSH_ACCESS_IP=""
+SSH_HARDENED="no"
 RECONFIGURE_USER="yes"
 PASS1=""
 SSH_KEY=""
@@ -37,6 +37,8 @@ PEM_OWNER="root"
 # Shown literally in instructions, so "~" stays unexpanded on purpose.
 LOCAL_KEY_DIR="~/keys"
 SERVER_PUBLIC_IP=""
+# Read by setup.sh for the SSH test command it prints
+PUBLIC_ADDRESS_FILE="/var/lib/server-setup/public-address"
 OS_ID=""
 OS_VERSION_ID=""
 OS_PRETTY=""
@@ -102,7 +104,7 @@ detect_public_ip() {
         detected_ip=$(curl -4fsS --max-time 5 https://ifconfig.me/ip 2>/dev/null || true)
     fi
     if [ -z "$detected_ip" ] && command -v ip &>/dev/null; then
-        detected_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+        detected_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}' || true)
     fi
 
     if [[ "$detected_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -200,22 +202,18 @@ EOF
     log_success "Hostname set to $HOSTNAME_VAL."
 }
 
-# After Phase 2, SSH is on a different port and only reachable over Tailscale,
-# so a rerun must print that route or the commands will not connect.
+# After Phase 2, SSH is on a different port, so a rerun must print that port
+# or the commands will not connect.
 detect_ssh_access() {
     local configured_port
-    local ts_ip
 
     configured_port="$(sshd -T 2>/dev/null | awk '$1 == "port" && !found {print $2; found = 1}' || true)"
     if [[ "$configured_port" =~ ^[0-9]+$ ]]; then
         SSH_PORT="$configured_port"
     fi
 
-    if [ "$SSH_PORT" != "22" ] && command -v tailscale &>/dev/null; then
-        ts_ip="$(tailscale ip -4 2>/dev/null | tr -d '[:space:]' || true)"
-        if [[ "$ts_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            SSH_ACCESS_IP="$ts_ip"
-        fi
+    if [ "$SSH_PORT" != "22" ]; then
+        SSH_HARDENED="yes"
     fi
 }
 
@@ -414,8 +412,11 @@ if [ "$RECONFIGURE_USER" = "yes" ]; then
     printf '%s:%s\n' "$TARGET_USER" "$PASS1" | chpasswd
 fi
 
+log_info "Updating and upgrading system packages before any hardening..."
+apt-get update && apt-get upgrade -y && apt-get autoremove -y
+
 log_info "Adding '$TARGET_USER' to sudo group..."
-apt-get update && apt-get install -y sudo
+apt-get install -y sudo
 usermod -aG sudo "$TARGET_USER"
 
 # Double verify groups
@@ -474,6 +475,10 @@ apt-get install -y curl git nano rsyslog gnupg ca-certificates
 
 log_info "Detecting server public IP for final SSH instructions..."
 detect_public_ip
+# setup.sh prints this address in its SSH test command.
+mkdir -p "$(dirname "$PUBLIC_ADDRESS_FILE")"
+printf '%s\n' "$SERVER_PUBLIC_IP" > "$PUBLIC_ADDRESS_FILE"
+chmod 644 "$PUBLIC_ADDRESS_FILE"
 detect_ssh_access
 ensure_user_allowed_by_sshd
 
@@ -498,7 +503,7 @@ else
 fi
 
 # 6. Inform next steps
-SSH_HOST="$(format_ssh_host "${SSH_ACCESS_IP:-$SERVER_PUBLIC_IP}")"
+SSH_HOST="$(format_ssh_host "$SERVER_PUBLIC_IP")"
 SSH_IDENTITY=""
 SSH_PORT_OPT=""
 SCP_PORT_OPT=""
@@ -515,26 +520,28 @@ log_success "Hostname '$HOSTNAME_VAL', timezone '$TIMEZONE_VAL'; user '$TARGET_U
 log_info "To ensure you are not locked out, keep this terminal session open!"
 log_warning "ACTION REQUIRED:"
 printf "%s. Open a ${CYAN}NEW terminal window${NC} on your local computer.\n" "$STEP"
-if [ -n "$SSH_ACCESS_IP" ]; then
-    printf "   This server is already hardened: SSH works only over Tailscale on port %s, so connect Tailscale first.\n" "$SSH_PORT"
+if [ "$SSH_HARDENED" = "yes" ]; then
+    printf "   This server is already hardened: SSH is on port %s, with key-only login.\n" "$SSH_PORT"
 fi
 STEP=$((STEP + 1))
 
 if [ -n "$PEM_FILE" ] && [ -f "$PEM_FILE" ]; then
     PEM_NAME="$(basename "$PEM_FILE")"
     SSH_IDENTITY="-i $LOCAL_KEY_DIR/$PEM_NAME -o IdentitiesOnly=yes "
-    if [ "$PEM_OWNER" = "$TARGET_USER" ] || { [ "$PEM_OWNER" = "root" ] && [ -n "$SSH_ACCESS_IP" ]; }; then
-        # scp would need the new key (own account) or a root SSH login, which a
+    if [ "$PEM_OWNER" = "$TARGET_USER" ] || { [ "$PEM_OWNER" = "root" ] && [ "$SSH_HARDENED" = "yes" ]; }; then
+        # The helper would need the new key (own account) or a root SSH login, which a
         # hardened server refuses.
         printf "%s. Copy the private key: type 'show' at the prompt below and save the output to %s/%s on your computer.\n" "$STEP" "$LOCAL_KEY_DIR" "$PEM_NAME"
+        printf "   ${BLUE}chmod 600 %s/%s${NC}\n" "$LOCAL_KEY_DIR" "$PEM_NAME"
     else
-        printf "%s. Download the private key (run these on your computer, not on the server):\n" "$STEP"
-        printf "   ${BLUE}mkdir -p %s${NC}\n" "$LOCAL_KEY_DIR"
-        printf "   ${BLUE}scp %s%s@%s:%s %s/%s${NC}\n" "$SCP_PORT_OPT" "$PEM_OWNER" "$SSH_HOST" "$PEM_FILE" "$LOCAL_KEY_DIR" "$PEM_NAME"
-        printf "   If that asks for a password or is refused, add the key file you log in with: -i /path/to/that/key\n"
-        printf "   If macOS says 'Operation not permitted', the folder is locked: ${BLUE}chflags nouchg %s${NC}\n" "$LOCAL_KEY_DIR"
+        FETCH_PORT_OPT=""
+        if [ "$SSH_PORT" != "22" ]; then
+            FETCH_PORT_OPT="-p $SSH_PORT "
+        fi
+        printf "%s. Download the private key. Run this on your computer, in the folder that contains fetch-key.sh:\n" "$STEP"
+        printf "   ${BLUE}./fetch-key.sh %s%s@%s %s${NC}\n" "$FETCH_PORT_OPT" "$PEM_OWNER" "$SSH_HOST" "$PEM_FILE"
+        printf "   If that asks for a password or is refused, add the key you log in with: -i /path/to/that/key\n"
     fi
-    printf "   ${BLUE}chmod 600 %s/%s${NC}\n" "$LOCAL_KEY_DIR" "$PEM_NAME"
     printf "   Optional, add a passphrase locally: ${BLUE}ssh-keygen -p -f %s/%s${NC}\n" "$LOCAL_KEY_DIR" "$PEM_NAME"
     STEP=$((STEP + 1))
 fi

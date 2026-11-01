@@ -33,11 +33,8 @@ PREVIOUS_SSH_PORT=""
 # done / pending / skipped, recorded by confirm_provider_firewall for check-health.sh
 PROVIDER_FIREWALL_STATE_FILE="/var/lib/server-setup/provider-firewall"
 PROVIDER_FIREWALL_STATUS=""
-# Tailscale address of this server, set by install_tailscale
-TAILSCALE_IP=""
-# yes/no: advertise this server as a Tailscale exit node; read by check-health.sh
-VPN_FULL_TUNNEL="no"
-VPN_FULL_TUNNEL_STATE_FILE="/var/lib/server-setup/vpn-full-tunnel"
+# Address the admin uses to reach this server, written by bootstrap.sh
+PUBLIC_ADDRESS_FILE="/var/lib/server-setup/public-address"
 HOSTNAME_VAL=""
 LYNIS_TARGET_SCORE=83
 SSH_ROLLBACK_UNIT="ssh-hardening-rollback"
@@ -306,15 +303,14 @@ prompt_ssh_port() {
     # the port sshd already uses is offered, so Enter keeps the working one.
     while true; do
         if [ -n "$current_port" ]; then
-            read -r -p "SSH port, reachable only over Tailscale [$current_port]: " port_input
+            read -r -p "SSH port [$current_port]: " port_input
             TARGET_PORT="${port_input:-$current_port}"
         else
-            read -r -p "SSH port, reachable only over Tailscale (1024-65535, for example 1234): " port_input
+            read -r -p "SSH port (1024-65535, for example 1234): " port_input
             TARGET_PORT="$port_input"
         fi
 
-        # 22 is excluded by the range on purpose: Tailscale SSH already answers on
-        # port 22 of the Tailscale IP, so sshd would be unreachable there.
+        # 22 stays excluded: bots scan it first, and a higher port keeps the logs quiet.
         if [[ ! "$TARGET_PORT" =~ ^[1-9][0-9]*$ ]] || [ "$TARGET_PORT" -lt 1024 ] || [ "$TARGET_PORT" -gt 65535 ]; then
             log_error "Use a number from 1024 to 65535."
             continue
@@ -332,43 +328,12 @@ prompt_ssh_port() {
         fi
         break
     done
-    log_info "SSH will listen on port $TARGET_PORT (Tailscale only)."
-}
-
-# Optional: let your devices send all their internet traffic through this
-# server. Tailscale calls this an exit node.
-prompt_exit_node() {
-    local tunnel_input
-
-    printf "\n"
-    log_info "An exit node lets your devices send ALL internet traffic through this server."
-    printf "  Your traffic then leaves from the server's IP address and uses its bandwidth.\n"
-    printf "  You still have to approve it in the admin console and select it on each device.\n"
-    read -r -p "Advertise this server as a Tailscale exit node? (y/N): " tunnel_input
-    if [[ "$tunnel_input" =~ ^[Yy]$ ]]; then
-        VPN_FULL_TUNNEL="yes"
-        log_info "Exit node: enabled"
-    else
-        VPN_FULL_TUNNEL="no"
-        log_info "Exit node: disabled"
-    fi
-}
-
-# An exit node forwards client traffic to the internet. The kernel hardening
-# file deliberately leaves forwarding alone (Docker needs it), so set it
-# explicitly here.
-enable_ip_forwarding() {
-    log_info "Enabling IPv4 forwarding for the exit node..."
-    cat << 'EOF' > /etc/sysctl.d/61-vpn-forward.conf
-# Managed by setup.sh: required to route exit node traffic to the internet.
-net.ipv4.ip_forward = 1
-EOF
-    sysctl -p /etc/sysctl.d/61-vpn-forward.conf
+    log_info "SSH will listen on port $TARGET_PORT."
 }
 
 # Root gets locked in Phase 2, and provider emergency consoles log in with a
 # password, not a key. Without a usable admin password there is no way back in
-# if Tailscale or SSH ever breaks.
+# if SSH ever breaks.
 ensure_admin_password() {
     local password_status
 
@@ -398,7 +363,6 @@ verify_environment() {
     check_admin_ssh_keys
     ensure_admin_password
     prompt_ssh_port
-    prompt_exit_node
 
     # Hostname and timezone are set in bootstrap.sh (Phase 1); Phase 2 only reads them.
     HOSTNAME_VAL="$(hostname -s)"
@@ -615,126 +579,6 @@ EOF
     swapon --show
 }
 
-# 4. Tailscale Installation
-install_tailscale() {
-    printf "\n=== 3. Tailscale Setup ===\n"
-    
-    if command -v tailscale &>/dev/null; then
-        log_info "Tailscale is already installed."
-    else
-        log_info "Installing Tailscale..."
-        curl -fsSL https://tailscale.com/install.sh | sh
-    fi
-    
-    log_info "Starting Tailscale and waiting for authentication..."
-
-    # --accept-routes=false: a subnet route advertised elsewhere in the tailnet
-    # that overlaps this server's own network (for example a 10.x private/VPC
-    # range) would pull its local traffic into Tailscale and cut it off.
-    # On reruns the node is already logged in. "tailscale up" then refuses to run
-    # unless every non-default setting is repeated, so change settings with
-    # "tailscale set" instead.
-    if [ "$(tailscale status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true)" = "Running" ]; then
-        log_info "Tailscale is already logged in; applying settings with tailscale set."
-        if ! tailscale set --ssh --accept-dns=true --accept-routes=false; then
-            log_error "tailscale set failed. Check: tailscale status"
-            exit 1
-        fi
-    else
-        log_warning "Please authenticate the server in the browser link printed below:"
-        if ! tailscale up --ssh --accept-dns=true --accept-routes=false; then
-            log_error "tailscale up command failed! Please verify if tailscaled daemon is active."
-            exit 1
-        fi
-    fi
-
-    log_info "Waiting for Tailscale connection to become fully active (Max 2 minutes)..."
-    local timeout=120
-    local elapsed=0
-    until tailscale status &>/dev/null; do
-        if [ "$elapsed" -ge "$timeout" ]; then
-            log_error "Tailscale activation timed out after 2 minutes! Setup halted."
-            exit 1
-        fi
-        sleep 5
-        elapsed=$((elapsed + 5))
-        log_info "Still waiting for Tailscale activation (${elapsed}s/120s)..."
-    done
-    
-    TAILSCALE_IP=$(tailscale ip -4 | tr -d '[:space:]')
-    log_success "Tailscale active! Internal IP: $TAILSCALE_IP"
-
-    if [ "$VPN_FULL_TUNNEL" = "yes" ]; then
-        enable_ip_forwarding
-        log_info "Advertising this server as a Tailscale exit node..."
-        if tailscale set --advertise-exit-node; then
-            log_success "Exit node advertised."
-            log_warning "Approve it in the Tailscale admin console (Machines -> this server -> Edit route settings), then select it on each device."
-        else
-            log_warning "Could not advertise the exit node. Run manually: tailscale set --advertise-exit-node"
-        fi
-    fi
-
-    check_tailscale_key_expiry
-    remind_tailscale_ssh_policy
-
-    mkdir -p "$(dirname "$VPN_FULL_TUNNEL_STATE_FILE")"
-    printf '%s\n' "$VPN_FULL_TUNNEL" > "$VPN_FULL_TUNNEL_STATE_FILE"
-    chmod 644 "$VPN_FULL_TUNNEL_STATE_FILE"
-}
-
-# --ssh keeps Tailscale SSH on port 22 of the Tailscale IP as an emergency path
-# if sshd breaks. It is authorized by the tailnet policy, not sshd_config, so
-# the policy must not allow logging in as root. That cannot be enforced from
-# the server; remind the user where to set it.
-remind_tailscale_ssh_policy() {
-    log_warning "Tailscale SSH is enabled as an emergency login path (port 22 on the Tailscale IP)."
-    log_warning "It ignores sshd_config (AllowUsers, key-only login, root lock). Your tailnet policy decides who gets in."
-    log_warning "In the Tailscale admin console -> Access controls, make every \"ssh\" rule use: \"users\": [\"autogroup:nonroot\"] (no \"root\")."
-}
-
-tailscale_key_expiry() {
-    tailscale status --json 2>/dev/null | jq -r '.Self.KeyExpiry // empty' 2>/dev/null || true
-}
-
-# SSH is reachable only through Tailscale after Phase 2. Tailscale node keys
-# expire (180 days by default); when that happens the server silently leaves
-# the tailnet and SSH is gone until someone uses the emergency console.
-check_tailscale_key_expiry() {
-    local key_expiry
-    local answer
-
-    if ! command -v jq >/dev/null 2>&1; then
-        log_warning "jq is missing, so Tailscale key expiry could not be checked. Disable key expiry for this machine in the Tailscale admin console."
-        return 0
-    fi
-
-    key_expiry="$(tailscale_key_expiry)"
-    if [ -z "$key_expiry" ]; then
-        log_success "Tailscale key expiry is disabled for this machine."
-        return 0
-    fi
-
-    log_warning "======================================================================"
-    log_warning "This server's Tailscale key EXPIRES on $key_expiry."
-    log_warning "After that the server leaves Tailscale and SSH (Tailscale-only) becomes unreachable."
-    log_warning "Fix: Tailscale admin console -> Machines -> $(hostname -s) -> '...' menu -> Disable key expiry."
-    log_warning "======================================================================"
-    read -r -p "Press Enter after disabling key expiry (or type skip to continue anyway): " answer
-    if [ "$answer" = "skip" ]; then
-        log_warning "Continuing with key expiry enabled. ~/check-health.sh will keep reporting it."
-        return 0
-    fi
-
-    sleep 5
-    key_expiry="$(tailscale_key_expiry)"
-    if [ -z "$key_expiry" ]; then
-        log_success "Tailscale key expiry is now disabled."
-    else
-        log_warning "Key expiry still shows $key_expiry (it can take a minute to sync). Verify it in the admin console."
-    fi
-}
-
 prepare_ssh_host_keys() {
     local rsa_bits
 
@@ -767,14 +611,6 @@ prepare_ssh_host_keys() {
 # 5. SSH Hardening with Verification Gate
 configure_ssh_hardening() {
     printf "\n=== 4. SSH Hardening ===\n"
-
-    # Tailscale address of this server, set by install_tailscale
-    local vpn_ip="$TAILSCALE_IP"
-
-    if [ -z "$vpn_ip" ]; then
-        log_error "No Tailscale address available. Aborting SSH hardening to avoid lockout."
-        exit 1
-    fi
 
     if [ -f /etc/ssh/sshd_config.bak ]; then
         log_info "Existing sshd_config backup found at /etc/ssh/sshd_config.bak; preserving it."
@@ -862,13 +698,12 @@ configure_ssh_hardening() {
     # second admin never silently removes the first one from AllowUsers.
     local allow_users="$TARGET_USER"
     local existing_user
-    if grep -qxF "port $TARGET_PORT" <<< "$(sshd -T 2>/dev/null || true)"; then
-        while read -r existing_user; do
-            if [ -n "$existing_user" ] && [ "$existing_user" != "$TARGET_USER" ] && id "$existing_user" &>/dev/null; then
-                allow_users+=" $existing_user"
-            fi
-        done <<< "$(sshd -T 2>/dev/null | awk '$1 == "allowusers" {print $2}' || true)"
-    fi
+    # Read from the running config, so a port change does not drop other admins.
+    while read -r existing_user; do
+        if [ -n "$existing_user" ] && [ "$existing_user" != "$TARGET_USER" ] && id "$existing_user" &>/dev/null; then
+            allow_users+=" $existing_user"
+        fi
+    done <<< "$(sshd -T 2>/dev/null | awk '$1 == "allowusers" {print $2}' || true)"
     log_info "SSH login will be allowed for: $allow_users"
 
     # Shown by sshd (Banner) and on the console. Replaces Debian's default,
@@ -885,10 +720,7 @@ EOF
     cat << EOF > /etc/ssh/sshd_config
 # Hardened OpenSSH Daemon Configuration (Debian 13)
 #
-# Do not bind sshd to the Tailscale IP with ListenAddress.
-# On reboot, ssh can start before tailscale0 receives its IP, which makes
-# port $TARGET_PORT refuse connections. UFW restricts this port to tailscale0
-# instead.
+# No ListenAddress: UFW allows port $TARGET_PORT on all addresses.
 #
 # sshd uses the first value it reads for each keyword, so these settings win
 # over anything in the sshd_config.d drop-ins included at the bottom.
@@ -962,7 +794,10 @@ EOF
     fi
 
     log_info "Restarting SSH service..."
-    systemctl restart ssh
+    if ! systemctl restart ssh; then
+        perform_ssh_rollback_now "SSH service failed to restart. Rolling back immediately."
+        exit 1
+    fi
     if ! systemctl is-active --quiet ssh; then
         perform_ssh_rollback_now "SSH service is not active after restart. Rolling back immediately."
         exit 1
@@ -973,24 +808,26 @@ EOF
     fi
     
     # Configure UFW rules BEFORE prompt to allow the user to test UFW seamlessly
-    configure_ufw_firewall "$vpn_ip"
+    configure_ufw_firewall
+
+    local server_address
+    server_address="$(cat "$PUBLIC_ADDRESS_FILE" 2>/dev/null || true)"
+    server_address="${server_address:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 
     log_warning "======================================================================"
     log_warning "                    SSH SAFETY VERIFICATION GATE                      "
     log_warning "======================================================================"
     log_warning "SSH has been moved to Port $TARGET_PORT."
-    log_warning "Firewall access is restricted to the tailscale0 interface only ($vpn_ip)."
     log_warning "Do NOT close this current terminal session under any circumstances!"
     log_warning "Automatic rollback is armed for ${SSH_ROLLBACK_DELAY_MINUTES} minutes and will be cancelled only after you type yes."
     log_warning "ACTION REQUIRED:"
-    log_warning "1. Ensure your local computer is connected to Tailscale."
-    log_warning "2. Open a NEW terminal window on your local machine."
-    log_warning "3. Test the hardened connection by running:"
-    log_warning "   ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$vpn_ip"
+    log_warning "1. Open a NEW terminal window on your local machine."
+    log_warning "2. Test the hardened connection by running:"
+    log_warning "   ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$server_address"
     log_warning "   (Use the .pem file bootstrap.sh generated. IdentitiesOnly=yes matters: MaxAuthTries is 3.)"
-    log_warning "   Your SSH client sees the Tailscale address and port as a new host, so it will ask you to confirm the fingerprint."
+    log_warning "   Your SSH client sees the new port, so it will ask you to confirm the fingerprint."
     log_warning "======================================================================"
-    
+
     while true; do
         read -r -p "Did the new SSH connection connect successfully? (yes/no): " ssh_success
         if [[ "$ssh_success" =~ ^[Yy][Ee][Ss]$ ]]; then
@@ -1006,7 +843,7 @@ EOF
             break
         elif [[ "$ssh_success" =~ ^[Nn][Oo]$ ]]; then
             perform_ssh_rollback_now "SSH verification failed. Rolling back config changes immediately."
-            log_warning "Please debug Tailscale network connectivity before executing again."
+            log_warning "Check the SSH port and key, then run setup.sh again."
             exit 1
         else
             log_warning "Please type 'yes' or 'no'."
@@ -1016,16 +853,9 @@ EOF
 
 # 6. UFW Firewall Setup
 configure_ufw_firewall() {
-    local vpn_ip=$1
     log_info "Installing and configuring UFW firewall..."
     apt-get install -y ufw
-    
-    # Verify the tailscale0 interface exists
-    if ! ip link show tailscale0 &>/dev/null; then
-        log_warning "tailscale0 network interface was not detected by the OS. Waiting 5s..."
-        sleep 5
-    fi
-    
+
     # Configure default rules
     ufw default deny incoming
     ufw default allow outgoing
@@ -1034,16 +864,16 @@ configure_ufw_firewall() {
     # Open standard web traffic
     ufw allow 80/tcp comment 'HTTP'
     ufw allow 443/tcp comment 'HTTPS'
-    ufw allow 443/udp comment 'HTTP/3 (Caddy)'
 
-    # Open the SSH port only on the tailscale0 interface
-    ufw allow in on tailscale0 to any port "$TARGET_PORT" proto tcp comment 'SSH via Tailscale only'
+    # Open the SSH port to all addresses. Key-only login, root login off and
+    # CrowdSec protect it.
+    ufw allow "$TARGET_PORT/tcp" comment 'SSH'
 
     # If the SSH port changed since the last run, close the old one. A rollback
     # restores it from the pre-run UFW snapshot.
     if [[ "$PREVIOUS_SSH_PORT" =~ ^[0-9]+$ ]] && [ "$PREVIOUS_SSH_PORT" != "22" ] && [ "$PREVIOUS_SSH_PORT" != "$TARGET_PORT" ]; then
         log_info "Closing the previous SSH port $PREVIOUS_SSH_PORT in UFW..."
-        ufw delete allow in on tailscale0 to any port "$PREVIOUS_SSH_PORT" proto tcp >/dev/null 2>&1 || true
+        ufw delete allow "$PREVIOUS_SSH_PORT/tcp" >/dev/null 2>&1 || true
     fi
 
     log_info "Enabling UFW..."
@@ -1123,10 +953,10 @@ configure_crowdsec() {
     fi
 
     systemctl restart crowdsec
-    systemctl enable crowdsec-firewall-bouncer
+    systemctl enable crowdsec-firewall-bouncer || log_warning "Could not enable crowdsec-firewall-bouncer."
     # A rerun replaces the bouncer API key; "enable --now" would leave an
     # already-running bouncer on the deleted key and bans would stop applying.
-    systemctl restart crowdsec-firewall-bouncer
+    systemctl restart crowdsec-firewall-bouncer || log_warning "Could not restart crowdsec-firewall-bouncer; check: systemctl status crowdsec-firewall-bouncer"
     
     log_info "Updating CrowdSec Hub..."
     cscli hub update
@@ -1158,22 +988,6 @@ nodes:
           expression: "evt.Parsed.logsource"
 EOF
 
-    # Admin SSH arrives from Tailscale (100.64.0.0/10), which the default
-    # CrowdSec whitelist does not cover. A few failed key attempts would ban
-    # the admin's Tailscale IP, and the nftables bouncer blocks it on every
-    # interface, including tailscale0: a lockout.
-    log_info "Whitelisting Tailscale addresses in CrowdSec..."
-    mkdir -p /etc/crowdsec/parsers/s02-enrich
-    cat > /etc/crowdsec/parsers/s02-enrich/tailscale-whitelist.yaml << 'EOF'
-name: custom/tailscale-whitelist
-description: "Never ban Tailscale addresses; admin SSH arrives from them"
-whitelist:
-  reason: "Tailscale network"
-  cidr:
-    - "100.64.0.0/10"
-    - "fd7a:115c:a1e0::/48"
-EOF
-
     # sshd logs reach CrowdSec once, through /var/log/auth.log (rsyslog). A
     # second journalctl source for ssh.service would count every failed login
     # twice and halve the ban threshold.
@@ -1203,12 +1017,6 @@ EOF
     log_info "Starting CrowdSec services..."
     systemctl restart crowdsec
     systemctl enable crowdsec
-
-    # Lift bans on individual Tailscale IPs made before the whitelist loaded.
-    # --contained matches decisions inside the range; without it only a ban on
-    # the whole range itself would be deleted.
-    cscli decisions delete --range 100.64.0.0/10 --contained >/dev/null 2>&1 || true
-    cscli decisions delete --range fd7a:115c:a1e0::/48 --contained >/dev/null 2>&1 || true
 
     # Keep parsers and scenarios current (the package ships this timer but does
     # not always enable it).
@@ -1332,7 +1140,7 @@ EOF
 # never collides with a manual apt run), repairs interrupted dpkg runs,
 # installs in small steps that survive power loss, and logs every run.
 configure_automatic_updates() {
-    log_info "Configuring automatic updates (Debian + Tailscale, Docker, CrowdSec, Caddy)..."
+    log_info "Configuring automatic updates (Debian, Docker, CrowdSec, Caddy)..."
 
     cat << 'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
 APT::Periodic::Enable "1";
@@ -1350,7 +1158,7 @@ Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename}-updates";
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
         // Third-party repositories added by setup.sh
-        "origin=Tailscale,label=Tailscale";
+        "origin=Docker,label=Docker CE";
         "origin=packagecloud.io/crowdsec/crowdsec";
         "origin=cloudsmith/caddy/stable";
 };
@@ -1376,9 +1184,6 @@ Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::SyslogEnable "true";
 Unattended-Upgrade::SyslogFacility "daemon";
 EOF
-
-    # Docker ships its own repository, so it needs its own origin entry.
-    sed -i 's|^\( *\)"origin=Tailscale,label=Tailscale";|&\n\1"origin=Docker,label=Docker CE";|' /etc/apt/apt.conf.d/50unattended-upgrades
 
     # Fixed maintenance window in the server's time zone instead of the
     # default random daytime slot.
@@ -1427,7 +1232,7 @@ verify_automatic_updates() {
 
     # Every third-party origin in 50unattended-upgrades must match a configured
     # repository, or that software silently never updates.
-    local origins=(Debian Tailscale packagecloud.io/crowdsec/crowdsec cloudsmith/caddy/stable Docker)
+    local origins=(Debian packagecloud.io/crowdsec/crowdsec cloudsmith/caddy/stable Docker)
 
     policy="$(LC_ALL=C apt-cache policy 2>/dev/null || true)"
     for origin in "${origins[@]}"; do
@@ -1641,39 +1446,6 @@ configure_caddy() {
 
     install_caddy
 
-    # QUIC (HTTP/3) needs larger UDP buffers than the kernel default.
-    cat << 'EOF' > /etc/sysctl.d/60-caddy-quic.conf
-net.core.rmem_max = 7500000
-net.core.wmem_max = 7500000
-EOF
-    sysctl -p /etc/sysctl.d/60-caddy-quic.conf
-
-    log_info "Writing default site..."
-    mkdir -p /var/www/html
-    chmod 755 /var/www /var/www/html
-    # Only replace the page this script created, never a deployed index.html.
-    if [ ! -f /var/www/html/index.html ] || grep -q 'setup.sh default page' /var/www/html/index.html; then
-        cat << EOF > /var/www/html/index.html
-<!doctype html>
-<!-- setup.sh default page -->
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Server online</title>
-  <style>
-    body { font-family: sans-serif; margin: 3rem; line-height: 1.5; color: #111; }
-  </style>
-</head>
-<body>
-  <h1>Server online</h1>
-  <p>No site is configured for this address.</p>
-</body>
-</html>
-EOF
-    fi
-    # The login umask is 027; Caddy runs as the caddy user and must read this.
-    chmod 644 /var/www/html/index.html
 
     # Access log must be owned by caddy before anything opens it as root.
     install -d -m 750 -o caddy -g caddy /var/log/caddy
@@ -1717,6 +1489,13 @@ EOF
 # Managed by setup.sh: reruns overwrite this file.
 # Put your own sites in /etc/caddy/sites/*.caddy (see README.caddy there).
 
+# HTTP/3 (UDP 443) is off: only HTTP/1.1 and HTTP/2 over TCP 443.
+{
+	servers {
+		protocols h1 h2
+	}
+}
+
 # Shared settings; add "import site_defaults" to every site.
 (site_defaults) {
 	encode zstd gzip
@@ -1745,12 +1524,12 @@ EOF
 	respond @hidden 404
 }
 
-# Default site for requests that match no domain (plain HTTP on the IP).
+# Requests that match no domain (plain HTTP on the IP) get an empty 404.
+# /health stays open for the health check.
 :80 {
 	import site_defaults
 	respond /health "ok" 200
-	root * /var/www/html
-	file_server
+	respond 404
 }
 
 import /etc/caddy/sites/*.caddy
@@ -1766,10 +1545,10 @@ EOF
     fi
 
     systemctl enable caddy
-    systemctl reload-or-restart caddy
+    systemctl reload-or-restart caddy || log_warning "Caddy did not reload; check: systemctl status caddy"
 
     if curl -fsS --max-time 5 http://127.0.0.1/health >/dev/null; then
-        log_success "Caddy is serving the default site on port 80 (/health returns ok)."
+        log_success "Caddy is serving port 80 (/health returns ok; unknown hosts get 404)."
     else
         log_warning "Caddy did not answer on http://127.0.0.1/health. Check: sudo journalctl -u caddy -n 50"
     fi
@@ -1880,7 +1659,6 @@ configure_docker_firewall() {
 -A DOCKER-USER -j RETURN -s 10.0.0.0/8
 -A DOCKER-USER -j RETURN -s 172.16.0.0/12
 -A DOCKER-USER -j RETURN -s 192.168.0.0/16
--A DOCKER-USER -i tailscale0 -j RETURN
 
 -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
 
@@ -1925,121 +1703,6 @@ configure_docker() {
     configure_docker_firewall
 
     log_success "Docker Engine configured successfully."
-}
-
-# 13. GitHub Deploy Key Helper
-# GitHub accepts a deploy key on only one repository, so there is no shared
-# server key. Instead install a helper that creates one key and one SSH host
-# alias per project when that project is deployed.
-install_github_deploy_key_helper() {
-    printf "\n=== 11. GitHub Deploy Key Helper ===\n"
-
-    local ssh_dir="$TARGET_HOME/.ssh"
-    local helper="$TARGET_HOME/github-deploy-key.sh"
-
-    mkdir -p "$ssh_dir"
-    chmod 700 "$ssh_dir"
-    chown "$TARGET_USER:$TARGET_USER" "$ssh_dir"
-
-    cat << 'HELPER' > "$helper"
-#!/usr/bin/env bash
-# Creates a GitHub deploy key for ONE repository plus an SSH host alias for it.
-# GitHub allows each deploy key on a single repository, so every project gets
-# its own key.
-#
-# Usage: ~/github-deploy-key.sh OWNER/REPO
-
-set -euo pipefail
-
-# Published at https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
-GITHUB_ED25519_FINGERPRINT="SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
-
-if [ "$EUID" -eq 0 ]; then
-    echo "Run this as the user that deploys the project, not with sudo." >&2
-    exit 1
-fi
-
-repo="${1:-}"
-repo="${repo%.git}"
-if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-    echo "Usage: $0 OWNER/REPO" >&2
-    exit 1
-fi
-
-owner="${repo%%/*}"
-name="${repo#*/}"
-host_alias="github-${owner}-${name}"
-ssh_dir="$HOME/.ssh"
-key_file="$ssh_dir/deploy_${owner}_${name}"
-ssh_config="$ssh_dir/config"
-known_hosts="$ssh_dir/known_hosts"
-
-mkdir -p "$ssh_dir"
-chmod 700 "$ssh_dir"
-
-if [ -f "$key_file" ]; then
-    echo "Reusing existing deploy key $key_file"
-else
-    ssh-keygen -q -t ed25519 -N "" -C "deploy:${repo}@$(hostname -s)" -f "$key_file"
-fi
-chmod 600 "$key_file"
-
-touch "$ssh_config"
-chmod 600 "$ssh_config"
-if ! grep -qxF "Host $host_alias" "$ssh_config"; then
-    cat << CONFIG >> "$ssh_config"
-
-Host $host_alias
-    HostName github.com
-    User git
-    IdentityFile $key_file
-    IdentitiesOnly yes
-CONFIG
-fi
-
-# Pin GitHub's host key instead of trusting whatever answers first.
-touch "$known_hosts"
-chmod 644 "$known_hosts"
-if ! ssh-keygen -F github.com -f "$known_hosts" >/dev/null; then
-    scanned_key="$(ssh-keyscan -t ed25519 github.com 2>/dev/null | grep -v '^#' || true)"
-    if [ -z "$scanned_key" ] || ! ssh-keygen -lf - <<< "$scanned_key" | grep -qF "$GITHUB_ED25519_FINGERPRINT"; then
-        echo "GitHub's SSH host key did not match the published fingerprint; refusing to trust it." >&2
-        exit 1
-    fi
-    printf '%s\n' "$scanned_key" >> "$known_hosts"
-fi
-
-printf "\n1. Open https://github.com/%s/settings/keys and click 'Add deploy key'.\n" "$repo"
-printf "2. Title: %s. Leave 'Allow write access' unchecked unless this server must push.\n" "$(hostname -s)"
-printf "3. Paste this public key:\n\n"
-cat "$key_file.pub"
-printf "\n"
-
-read -r -p "Press Enter after adding the key to test it (or type skip): " answer
-if [ "$answer" != "skip" ]; then
-    set +e
-    output="$(ssh -o BatchMode=yes -T "git@$host_alias" 2>&1)"
-    set -e
-    printf '%s\n' "$output"
-    if [[ "$output" == *"successfully authenticated"* ]]; then
-        echo "Deploy key works."
-    else
-        echo "Authentication did not succeed yet. Check the key on GitHub, then test with: ssh -T git@$host_alias" >&2
-    fi
-fi
-
-printf "\nClone:              git clone git@%s:%s.git\n" "$host_alias" "$repo"
-printf "Existing checkout:  git remote set-url origin git@%s:%s.git\n" "$host_alias" "$repo"
-HELPER
-
-    chmod 700 "$helper"
-    chown "$TARGET_USER:$TARGET_USER" "$helper"
-    log_success "Deploy key helper installed. For each project run: ~/github-deploy-key.sh OWNER/REPO"
-
-    if [ -f "$ssh_dir/github" ]; then
-        log_warning "A shared ~/.ssh/github key from an earlier version of this script still exists."
-        log_warning "Once every project uses its own deploy key, remove it from GitHub and delete ~/.ssh/github*, the 'Host github.com' block in ~/.ssh/config, and the ssh-agent lines in ~/.bashrc."
-    fi
 }
 
 # 14. Creating Health Check Utilities
@@ -2098,20 +1761,13 @@ else
     echo "No automatic update has run yet."
 fi
 
-echo -e "\n${YELLOW}8. Tailscale (only path for SSH):${NC}"
-if [ "$(cat /var/lib/server-setup/vpn-full-tunnel 2>/dev/null)" = "yes" ]; then
-    echo "Exit node: advertised (client internet traffic can exit from this server)"
-fi
-if tailscale status --peers=false >/dev/null 2>&1; then
-    echo "Tailscale is connected: $(tailscale ip -4 2>/dev/null)"
-    key_expiry="$(tailscale status --json 2>/dev/null | jq -r '.Self.KeyExpiry // empty' 2>/dev/null)"
-    if [ -n "$key_expiry" ]; then
-        echo -e "${RED}Node key expires on $key_expiry. Disable key expiry in the Tailscale admin console or SSH will stop working then.${NC}"
-    else
-        echo "Node key expiry is disabled."
-    fi
+echo -e "\n${YELLOW}8. SSH Access:${NC}"
+ssh_port="$(sudo sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+echo "SSH port: $ssh_port (open to all addresses; key-only login)"
+if sudo ufw status | grep -q "^$ssh_port/tcp"; then
+    echo "UFW allows the SSH port."
 else
-    echo -e "${RED}Tailscale is NOT connected. SSH is only reachable through Tailscale.${NC}"
+    echo -e "${RED}UFW does not allow the SSH port. Rerun setup.sh.${NC}"
 fi
 
 echo -e "\n${YELLOW}9. Reboot Requirement:${NC}"
@@ -2133,7 +1789,7 @@ case "$(cat /var/lib/server-setup/provider-firewall 2>/dev/null)" in
     done) echo "Marked as configured." ;;
     skipped) echo "Skipped (UFW on the server enforces the rules)." ;;
     *)
-        echo -e "${RED}Not configured yet: allow TCP 80, TCP 443 and UDP 443; remove TCP 22; add no SSH rule.${NC}"
+        echo -e "${RED}Not configured yet: allow TCP 80, TCP 443 and the SSH port from anywhere; remove TCP 22.${NC}"
         echo "When done, mark it: echo done | sudo tee /var/lib/server-setup/provider-firewall"
         ;;
 esac
@@ -2149,7 +1805,7 @@ EOF
 # The provider's firewall / security group can't be configured from inside the
 # server and differs per provider, so print the exact rules, ask whether they
 # are set, and record the answer for check-health.sh. Asked at the very end,
-# after SSH over Tailscale was verified, so removing public port 22 is safe.
+# after SSH on its new port was verified, so removing public port 22 is safe.
 confirm_provider_firewall() {
     printf "\n=== 14. Cloud Provider Firewall ===\n"
 
@@ -2166,10 +1822,9 @@ confirm_provider_firewall() {
     log_info "Set these inbound rules in your cloud provider's firewall / security group:"
     printf "   ALLOW   TCP 80      from 0.0.0.0/0 and ::/0   HTTP (Caddy, HTTPS certificate issuance)\n"
     printf "   ALLOW   TCP 443     from 0.0.0.0/0 and ::/0   HTTPS\n"
-    printf "   ALLOW   UDP 443     from 0.0.0.0/0 and ::/0   HTTP/3\n"
-    printf "   ALLOW   UDP 41641   from 0.0.0.0/0 and ::/0   optional: direct Tailscale connections\n"
-    printf "   REMOVE  TCP 22, and do NOT open TCP %s: SSH works only inside Tailscale\n" "$TARGET_PORT"
-    printf "   OUTBOUND: allow all (Tailscale, updates, CrowdSec, Docker)\n"
+    printf "   ALLOW   TCP %s from 0.0.0.0/0 and ::/0   SSH (key-only login)\n" "$TARGET_PORT"
+    printf "   REMOVE  TCP 22\n"
+    printf "   OUTBOUND: allow all (updates, CrowdSec, Docker)\n"
     log_warning "Before removing port 22, confirm the provider's emergency console gives you a login prompt."
     log_info "No network firewall at your provider? Choose skip: UFW already enforces the same rules on this server."
 
@@ -2248,11 +1903,7 @@ run_lynis_audit() {
     fi
 
     if [ -f /var/run/reboot-required ]; then
-        if [ -n "$TAILSCALE_IP" ]; then
-            log_warning "A reboot is required to finish applying kernel/service updates. Reconnect after reboot with: ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$TAILSCALE_IP"
-        else
-            log_warning "A reboot is required to finish applying kernel/service updates."
-        fi
+        log_warning "A reboot is required to finish applying kernel/service updates."
     fi
 }
 
@@ -2261,7 +1912,6 @@ main() {
     verify_environment
     configure_base_system
     configure_swap
-    install_tailscale
     configure_ssh_hardening
     lock_down_root
     configure_crowdsec
@@ -2269,7 +1919,6 @@ main() {
     configure_security_packages
     configure_caddy
     configure_docker
-    install_github_deploy_key_helper
     create_health_check
     verify_automatic_updates
     run_lynis_audit
@@ -2282,18 +1931,12 @@ main() {
     log_success "All security policies, firewalls, and application nodes are active!"
     log_info "Operating system: $OS_PRETTY"
     log_info "Summary of active endpoints:"
-    printf " - SSH Administrative Access:  ${CYAN}ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@$TAILSCALE_IP${NC}\n"
+    printf " - SSH Administrative Access:  ${CYAN}ssh -i ~/keys/$TARGET_USER-$HOSTNAME_VAL.pem -o IdentitiesOnly=yes -p $TARGET_PORT $TARGET_USER@%s${NC}\n" "$(cat "$PUBLIC_ADDRESS_FILE" 2>/dev/null || hostname -I | awk '{print $1}')"
     printf " - HTTP Public Interface:      ${CYAN}Port 80 (Open)${NC}\n"
-    printf " - HTTPS Public Interface:     ${CYAN}Port 443 TCP + UDP/HTTP3 (Open)${NC}\n"
+    printf " - HTTPS Public Interface:     ${CYAN}Port 443 TCP (Open)${NC}\n"
     printf " - Web server (Caddy) sites:   ${CYAN}/etc/caddy/sites/*.caddy${NC}\n"
     printf " - Automatic updates:          ${CYAN}nightly 03:30, reboots manual (~/check-health.sh)${NC}\n"
-    printf " - Tailscale SSH policy:       ${CYAN}set \"users\": [\"autogroup:nonroot\"] in the tailnet policy${NC}\n"
-    printf " - GitHub deploy key per repo: ${CYAN}~/github-deploy-key.sh OWNER/REPO${NC}\n"
     printf " - Provider firewall:          ${CYAN}%s${NC}\n" "$PROVIDER_FIREWALL_STATUS"
-    printf " - Admin VPN:                  ${CYAN}Tailscale on tailscale0 (%s)${NC}\n" "$TAILSCALE_IP"
-    if [ "$VPN_FULL_TUNNEL" = "yes" ]; then
-        printf " - Exit node:                  ${CYAN}advertised, approve it in the Tailscale admin console${NC}\n"
-    fi
     printf "${GREEN}======================================================================${NC}\n\n"
 }
 

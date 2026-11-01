@@ -1,7 +1,7 @@
 # Debian 13 Server Setup & Hardening
 
 Two interactive Bash scripts that turn a fresh **Debian 13 (Trixie)** server into a hardened, production-ready host. They take you from a new server to this, with safety checks at every step that could lock you out:
-- SSH reachable only through your Tailscale VPN;
+- SSH on a port you choose, with key-only login;
 - a firewall, intrusion prevention, kernel and audit hardening;
 - automatic updates;
 - the Caddy web server and Docker.
@@ -34,9 +34,7 @@ The scripts are **provider-neutral**: they work on any VPS or cloud server runni
 ## Features
 
 **Access**
-- SSH only over **Tailscale**, on a port you choose. Key-only login with an **Ed25519 key generated on the server**, and root login disabled.
-- **Tailscale SSH** as a separate emergency login path, limited to non-root users by your tailnet policy.
-- Optional **exit node**, so the server also works as your personal VPN gateway for browsing.
+- SSH on a port you choose, with key-only login using an **Ed25519 key generated on the server**, and root login disabled.
 - A **10-minute automatic rollback** while you test the new SSH connection, so a mistake can't lock you out.
 
 **Network protection**
@@ -51,10 +49,9 @@ The scripts are **provider-neutral**: they work on any VPS or cloud server runni
 - A root account that stays locked, but an emergency boot shell that still works from the provider console.
 
 **Operations**
-- **Automatic nightly updates** for Debian, Tailscale, CrowdSec, Caddy and Docker, with safeguards so configs are never overwritten.
-- The **Caddy** web server with automatic HTTPS and HTTP/3, plus a separate folder for your own sites.
+- **Automatic nightly updates** for Debian, CrowdSec, Caddy and Docker, with safeguards so configs are never overwritten.
+- The **Caddy** web server with automatic HTTPS, plus a separate folder for your own sites.
 - **Docker Engine** with a hardened daemon configuration.
-- A **GitHub deploy key helper** that creates one key per repository.
 - A **health check script** and a **Lynis** security audit (target score 83+; a test run scored 85).
 
 ---
@@ -65,8 +62,8 @@ Setup runs in two phases, both **on the server**:
 
 | Phase | Script | Runs as | What it does |
 |---|---|---|---|
-| 1 | `bootstrap.sh` | `root`, or `sudo` from the provider's default user | Sets the hostname and timezone, creates your admin user, generates the SSH login key, and copies `setup.sh` into the admin user's home |
-| 2 | `setup.sh` | The new admin user, with `sudo` | Hardens the whole system: Tailscale, SSH, firewall, CrowdSec, kernel, updates, Caddy and Docker |
+| 1 | `bootstrap.sh` | `root`, or `sudo` from the provider's default user | Upgrades the system packages, sets the hostname and timezone, creates your admin user, generates the SSH login key, and copies `setup.sh` into the admin user's home |
+| 2 | `setup.sh` | The new admin user, with `sudo` | Hardens the whole system: SSH, firewall, CrowdSec, kernel, updates, Caddy and Docker |
 
 The finished server is protected in layers:
 
@@ -74,21 +71,20 @@ The finished server is protected in layers:
 Internet
    │
    ├─ Provider firewall / security group   (you set this; the script prints the rules)
-   │    ├─ TCP 80, TCP 443, UDP 443  → allowed
+   │    ├─ TCP 80, TCP 443  → allowed
    │    └─ everything else, including SSH → blocked
    │
    ├─ UFW firewall (on the server)
    │    ├─ deny incoming by default
-   │    ├─ allow 80/tcp, 443/tcp, 443/udp
-   │    └─ allow the SSH port only on the tailscale0 interface
+   │    ├─ allow 80/tcp, 443/tcp
+   │    └─ allow the SSH port
    │
-   ├─ CrowdSec    bans attackers found in SSH and Caddy logs (Tailscale IPs are never banned)
-   ├─ Caddy       automatic HTTPS, HTTP/3, your sites in /etc/caddy/sites/
+   ├─ CrowdSec    bans attackers found in SSH and Caddy logs
+   ├─ Caddy       automatic HTTPS, your sites in /etc/caddy/sites/
    └─ Containers  Docker, published on 127.0.0.1 by default
 
-Tailscale VPN (100.x.x.x)
-   ├─ SSH on your chosen port  → admin login with the .pem key
-   └─ Tailscale SSH on port 22 → emergency login, non-root users only
+Admin computer
+   └─ SSH on your chosen port  → admin login with the .pem key
 
 Every night at 03:30 → automatic updates
 ```
@@ -99,7 +95,6 @@ Every night at 03:30 → automatic updates
 
 - A **fresh Debian 13 server** from any provider. The scripts refuse other operating systems, and other Debian releases need a confirmation.
 - **Root access**, or a default user with `sudo`.
-- A **Tailscale account**, with Tailscale installed and logged in **on your own computer**.
 - A **working emergency console** at your provider (web, VNC or serial console). Some providers require you to enable it first.
 - **Optional:**
   - a [CrowdSec console](https://app.crowdsec.net) enrollment key;
@@ -116,13 +111,12 @@ In the commands below, replace these placeholders:
 | `SERVER_IP` | The server's public IP address |
 | `ADMIN` | The admin username you choose in Phase 1 |
 | `HOST` | The hostname you choose in Phase 1 |
-| `TAILSCALE_IP` | The server's Tailscale IP (`100.x.x.x`), shown during Phase 2 |
 | `SSH_PORT` | The SSH port you choose in Phase 2 |
 | `LOGIN_KEY` | The key you use to log in to the fresh server today, for example your provider's key pair |
 
 ### 1. Prepare
 
-1. Open your provider's **emergency console** and confirm it shows a login prompt. After setup, it's your only way in if Tailscale ever fails.
+1. Open your provider's **emergency console** and confirm it shows a login prompt. It's the fallback if SSH breaks.
 2. Keep public SSH (port 22) open in your provider's firewall until setup is finished.
 
 ### 2. Get the scripts onto the server
@@ -158,19 +152,15 @@ Use plain `./bootstrap.sh` if you are already `root`. It asks for:
 
 The timezone is set to `Asia/Kolkata` automatically ([how to change it](#customizing-defaults)).
 
-The script then generates an **Ed25519 login key** named `ADMIN-HOST.pem` and prints the commands to download it. **Run these on your computer**, not on the server:
+The script then generates an **Ed25519 login key** named `ADMIN-HOST.pem` and prints one command to download it. **Run it on your computer**, from the folder that contains `fetch-key.sh`:
 
 ```bash
-mkdir -p ~/keys
-```
-```bash
-scp -i LOGIN_KEY root@SERVER_IP:/root/ADMIN-HOST.pem ~/keys/
-```
-```bash
-chmod 600 ~/keys/ADMIN-HOST.pem
+./fetch-key.sh -i LOGIN_KEY root@SERVER_IP /root/ADMIN-HOST.pem
 ```
 
-If you ran the script with `sudo` as the provider's default user, download from that user's home instead, for example `admin@SERVER_IP:/home/admin/ADMIN-HOST.pem`. The script prints the exact path.
+You need a copy of `fetch-key.sh` on your computer: clone this repository there, or download that one file. `fetch-key.sh` copies the key into `~/keys`, sets `chmod 600`, and checks that the file is a valid key. Use `-i` only if the login needs your provider's key. If you ran the script with `sudo` as the provider's default user, the command uses that user and the home folder instead. The script prints the exact command.
+
+The server copy stays until you type `delete` at the prompt.
 
 Test the new login from a **new terminal**:
 
@@ -196,13 +186,13 @@ It asks, in this order:
 | Prompt | What to do |
 |---|---|
 | SSH port | Type the port you want (1024–65535). Nothing is suggested; on a rerun, press Enter to keep the port sshd already uses |
-| Exit node | `y` lets your devices send **all** internet traffic through this server; `N` keeps Tailscale for reaching the server only ([details](#exit-node-use-the-server-as-your-vpn-gateway)) |
-| Tailscale key expiry | In the Tailscale admin console, open **Machines**, select this server, and choose **Disable key expiry**. Then press Enter |
-| **SSH verification** | Keep this terminal open. From a **new terminal**, run the command it shows: `ssh -i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes -p SSH_PORT ADMIN@TAILSCALE_IP`. If it works, type `yes`. If not, type `no` to roll back |
+| **SSH verification** | Keep this terminal open. From a **new terminal on the admin computer**, run the command it shows: `ssh -i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes -p SSH_PORT ADMIN@SERVER_IP`. If it works, type `yes`. If not, type `no` to roll back |
 | CrowdSec enrollment key | Optional; press Enter to skip |
 | Provider firewall | Set the rules it prints in your provider's firewall, then type `done`. Or type `not` (not yet) or `skip` (your provider has no firewall) |
 
 Before any of these, Phase 2 checks that the admin user has a valid SSH key, and asks you to set a password if the user has none.
+
+Two more prompts appear only in some cases: a warning asking whether to continue when you run `setup.sh` as a user other than the admin, and a question about switching from Nginx to Caddy when custom Nginx sites exist.
 
 Phase 2 ends with a Lynis security audit and a summary of how to reach the server.
 
@@ -216,12 +206,11 @@ Phase 2 ends with a Lynis security audit and a summary of how to reach the serve
    ```
 2. **Reboot test**: after `sudo reboot`, reconnect:
    ```bash
-   ssh -i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes -p SSH_PORT ADMIN@TAILSCALE_IP
+   ssh -i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes -p SSH_PORT ADMIN@SERVER_IP
    ```
-3. **Emergency path**: `ssh ADMIN@TAILSCALE_IP` should work; this is Tailscale SSH on port 22. `ssh root@TAILSCALE_IP` should be refused.
-4. **Emergency console**: log in with the admin password.
-5. **Tailscale policy**: make sure Tailscale SSH can't log in as root. See [Tailscale SSH](#tailscale-ssh-emergency-path).
-6. **Retire the provider's default user**, if your image has one, once everything above works:
+3. **Root is refused**: `ssh root@SERVER_IP -p SSH_PORT` should fail.
+4. **Emergency console**: log in with the admin password. This is the fallback if SSH breaks.
+5. **Retire the provider's default user**, if your image has one, once everything above works:
    ```bash
    sudo rm /home/DEFAULT_USER/.ssh/authorized_keys
    ```
@@ -243,54 +232,15 @@ Phase 2 ends with a Lynis security audit and a summary of how to reach the serve
 - **Hostname:** on cloud-init images, `/etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg` keeps it across reboots.
 - **Swap:** `/swapfile` sized to RAM (2 GB up to 2 GB of RAM, equal to RAM up to 8 GB, capped at 8 GB), with `vm.swappiness = 10` and `vm.vfs_cache_pressure = 50`.
 
-### Admin VPN: Tailscale
+### Access: key-only SSH
 
-Tailscale is the only admin VPN, and after Phase 2 it is the only way SSH is reachable. It needs no public port, works behind NAT, and keeps **Tailscale SSH** on port 22 as a second way in if the hardened port ever fails.
+SSH accepts connections from any address on your chosen port. The protection is:
 
-- Installed from Tailscale's official repository and logged in with `--ssh --accept-dns=true --accept-routes=false`.
-- **Setup stops if Tailscale isn't active within 2 minutes**, before SSH is touched.
-- `--accept-routes=false` stops a subnet route elsewhere in your tailnet from hijacking the server's own network.
-- **Key expiry:** node keys expire after 180 days by default, and an expired key would cut off SSH. The script asks you to disable expiry, and `check-health.sh` keeps reporting it.
-- **Exit node:** answering yes to the exit node question runs `tailscale set --advertise-exit-node`; approve it in the admin console and select it per device.
-
-#### Tailscale SSH: emergency path
-
-`--ssh` enables Tailscale SSH on port 22 of the Tailscale IP. It authenticates you through your Tailscale account instead of a key. That makes it a useful way in if sshd ever breaks, but it ignores `sshd_config`. **Your tailnet policy must stop it from logging in as root.**
-
-In the Tailscale admin console, open **Access controls** and make the `ssh` rule use `autogroup:nonroot`:
-
-```json
-"ssh": [
-  {
-    "action": "accept",
-    "src":    ["autogroup:member"],
-    "dst":    ["autogroup:self"],
-    "users":  ["autogroup:nonroot"]
-  }
-]
-```
-
-- **Stricter:** `"users": ["ADMIN"]` allows only the admin user.
-- **Protect your Tailscale login:** turn on two-factor login for the account you sign into Tailscale with, since that login now grants shell access.
-
-#### Exit node: use the server as your VPN gateway
-
-By default Tailscale only carries traffic to the server itself, so your normal browsing is untouched. Answer `y` to the exit node question and the server becomes your **personal VPN gateway**: your devices can send all internet traffic through it, which is what you want on public Wi-Fi or to leave from a fixed IP address.
-
-| | Off (default) | Exit node |
-|---|---|---|
-| Client routes | Only your tailnet | Everything |
-| Your public IP while connected | Your own | The server's |
-| Server bandwidth used | Almost none | All of your traffic |
-
-Setup then enables IPv4 forwarding in `/etc/sysctl.d/61-vpn-forward.conf` and runs `tailscale set --advertise-exit-node`. Two steps are left to you:
-
-1. **Approve it** in the admin console: **Machines → this server → Edit route settings → Use as exit node**.
-2. **Select it** on each device, under the Tailscale menu's **Exit node** entry.
-
-Tailscale handles the routing and NAT itself, so no extra firewall rules are added. Traffic only leaves through the server for devices that have actually selected it as their exit node, and the answer is saved in `/var/lib/server-setup/vpn-full-tunnel`, which the health check reads.
-
-To turn it off later, run `sudo tailscale set --advertise-exit-node=false`, or rerun Phase 2 and answer `N`.
+- **Key-only login** with the `.pem` key. Passwords are refused, and root login is disabled.
+- **`AllowUsers`** limits SSH to the admin user, plus any other admin you added.
+- **CrowdSec** bans addresses that fail repeatedly ([details](#crowdsec)).
+- **Protect the key.** It's the only way in. Add a passphrase on your computer with `ssh-keygen -p`.
+- **Emergency console:** your provider's console is the fallback if SSH breaks. Set it up before you start (see [Prepare](#1-prepare)).
 
 ### SSH
 
@@ -352,14 +302,14 @@ The algorithm lists are filtered against `ssh -Q`, so the file only contains alg
 - **Modern cryptography only:** post-quantum hybrid and Curve25519 key exchange, AEAD ciphers and encrypt-then-MAC. Weak Diffie-Hellman moduli (under 3072 bits) are removed, and RSA host keys under 3072 bits are regenerated.
 - **Your key type isn't restricted,** so existing Ed25519, RSA, ECDSA and hardware keys keep working. Very old clients that only support CBC ciphers can no longer connect.
 - **Cloud-image drop-ins can't override these settings.** The hardened lines come before the `Include`, and the script verifies the effective settings with `sshd -T`.
-- **No `ListenAddress`**, on purpose. SSH can start before Tailscale at boot, so the Tailscale-only restriction is enforced by the firewall instead.
+- **No `ListenAddress`**, on purpose. Binding sshd to one interface can stop it from starting at boot if that interface isn't up yet.
 
 **Lockout protection:**
 1. **Pre-flight checks:** the admin user must have a valid key and a password before anything changes.
 2. **Snapshot and rollback timer:** the current SSH config and firewall rules are saved, and a 10-minute automatic rollback is armed.
 3. **Validation:** the new config must pass `sshd -t`, SSH must be running, and the new port must be listening.
 4. **Your confirmation:** you test the login from a new terminal and type `yes`. If you're too late and the rollback already ran, the script stops instead of pretending the server is hardened.
-5. **Rollback:** it restores the state from **just before this run**, so a rerun on a hardened server stays Tailscale-only instead of reopening port 22.
+5. **Rollback:** it restores the state from **just before this run**, so a rerun on a hardened server restores the saved config instead of reopening port 22.
 
 ### Firewalls
 
@@ -372,8 +322,7 @@ ufw default allow outgoing
 ufw default deny forward
 ufw allow 80/tcp  comment 'HTTP'
 ufw allow 443/tcp comment 'HTTPS'
-ufw allow 443/udp comment 'HTTP/3 (Caddy)'
-ufw allow in on tailscale0 to any port SSH_PORT proto tcp comment 'SSH via Tailscale only'
+ufw allow SSH_PORT/tcp comment 'SSH'
 ```
 </details>
 
@@ -383,10 +332,9 @@ ufw allow in on tailscale0 to any port SSH_PORT proto tcp comment 'SSH via Tails
 |---|---|
 | Allow TCP 80 from `0.0.0.0/0` and `::/0` | HTTP and HTTPS certificate issuance |
 | Allow TCP 443 from `0.0.0.0/0` and `::/0` | HTTPS |
-| Allow UDP 443 from `0.0.0.0/0` and `::/0` | HTTP/3 (optional; browsers fall back to TCP) |
-| Allow UDP 41641 from `0.0.0.0/0` and `::/0` | Optional: direct Tailscale connections instead of relays |
-| **Remove TCP 22, and add no SSH rule** | SSH travels inside Tailscale |
-| Allow all outbound | Tailscale, updates, CrowdSec, Docker |
+| **Allow TCP SSH_PORT from `0.0.0.0/0` and `::/0`** | SSH, key-only login |
+| **Remove TCP 22** | The default SSH port is no longer used |
+| Allow all outbound | Updates, CrowdSec, Docker |
 
 Your answer (`done`, `not` or `skip`) is saved in `/var/lib/server-setup/provider-firewall`. If it's `not`, `check-health.sh` keeps reminding you. When you've set the rules, mark it done with:
 ```bash
@@ -397,65 +345,8 @@ echo done | sudo tee /var/lib/server-setup/provider-firewall
 
 - **Components:** the official engine plus the **nftables firewall bouncer**, with the `linux`, `sshd` and `caddy` collections. The hub updates daily.
 - **Log sources:** `/var/log/auth.log`, `/var/log/syslog` and the Caddy access log. SSH events are read once, so failed logins aren't counted twice.
-- **Tailscale addresses are never banned** (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`). Otherwise a few failed key attempts from your own laptop could ban your Tailscale IP and lock you out.
 - **Debian 13 support:** a custom parser handles Debian 13's `sshd-session` log lines.
 - **Optional:** enrollment in the CrowdSec console.
-
-<details>
-<summary><b>CrowdSec files</b></summary>
-
-`/etc/crowdsec/parsers/s02-enrich/tailscale-whitelist.yaml`
-```yaml
-name: custom/tailscale-whitelist
-description: "Never ban Tailscale addresses; admin SSH arrives from them"
-whitelist:
-  reason: "Tailscale admin network"
-  cidr:
-    - "100.64.0.0/10"
-    - "fd7a:115c:a1e0::/48"
-```
-
-`/etc/crowdsec/parsers/s00-raw/debian13-sshd-session.yaml`
-```yaml
-onsuccess: next_stage
-filter: "evt.Line.Raw contains 'sshd-session'"
-name: custom/debian13-sshd-session
-description: "Remap Debian 13 sshd-session to sshd before s01-parse"
-nodes:
-  - grok:
-      pattern: '%{SYSLOGTIMESTAMP:timestamp} %{HOSTNAME:logsource} sshd-session\[%{NUMBER:pid}\]: %{GREEDYDATA:message}'
-      apply_on: Line.Raw
-      statics:
-        - parsed: program
-          value: "sshd"
-        - parsed: pid
-          expression: "evt.Parsed.pid"
-        - parsed: message
-          expression: "evt.Parsed.message"
-        - parsed: source
-          expression: "evt.Parsed.logsource"
-```
-
-`/etc/crowdsec/acquis.yaml`
-```yaml
----
-filenames:
-  - /var/log/caddy/access.log
-labels:
-  type: caddy
----
-filenames:
-  - /var/log/auth.log
-  - /var/log/syslog
-labels:
-  type: syslog
----
-filenames:
-  - /var/log/apache2/*.log
-labels:
-  type: apache2
-```
-</details>
 
 ### Kernel, accounts and auditing
 
@@ -535,7 +426,7 @@ Updates use Debian's `unattended-upgrades` on its systemd timers, not a raw cron
 
 | Setting | Value |
 |---|---|
-| What updates | Debian (stable, point releases, security), Tailscale, CrowdSec, Caddy and Docker |
+| What updates | Debian (stable, point releases, security), CrowdSec, Caddy and Docker |
 | When | Package lists at 02:30, installs at **03:30 server time**. A missed window is skipped |
 | Config files | Kept (`--force-confold`), so an upgrade never resets `sshd_config`, UFW rules or the Caddyfile |
 | Services | `needrestart` restarts services that still use old libraries |
@@ -545,10 +436,10 @@ At the end, Phase 2 verifies that every repository is covered and runs a dry run
 
 ### Caddy web server
 
-- **Install and HTTPS:** installed from Caddy's official repository, with automatic HTTPS for real domain names and HTTP/3.
+- **Install and HTTPS:** installed from Caddy's official repository, with automatic HTTPS for real domain names. HTTP/3 is turned off, so only TCP 443 is used.
 - **`/etc/caddy/Caddyfile`** is managed by the script and replaced on reruns. It holds:
   - the shared `site_defaults` snippet: compression, security headers including HSTS, no `Server` header, a JSON access log, and a 404 for dotfiles such as `.git` and `.env`;
-  - a default site on port 80 with `/health`.
+  - port 80 answers `/health` and returns an empty 404 for any other request to the IP.
 - **`/etc/caddy/sites/*.caddy`** holds **your sites**. The script never touches these files.
 - **Validation:** new configs are validated before they're used, so a broken site file never takes the web server down.
 
@@ -599,27 +490,6 @@ Docker Engine and the Compose plugin come from Docker's own repository, which is
 - **Firewall rules:** Docker's own iptables rules normally bypass UFW. The script adds [ufw-docker](https://github.com/chaifeng/ufw-docker)-style rules to `/etc/ufw/after.rules`, so new public connections to containers are dropped. To expose a container port publicly on purpose, allow it with `sudo ufw route allow proto tcp from any to any port CONTAINER_PORT`.
 - **Port 8080 is taken:** don't publish containers on host port 8080, because CrowdSec's local API uses it.
 
-### GitHub deploy keys
-
-GitHub allows each deploy key on **one repository only**, so the server gets a helper instead of a shared key. Run it as the admin user, without `sudo`:
-
-```bash
-~/github-deploy-key.sh OWNER/REPO
-```
-
-It:
-1. creates `~/.ssh/deploy_OWNER_REPO` (Ed25519);
-2. adds a `Host github-OWNER-REPO` alias to `~/.ssh/config`;
-3. trusts GitHub's host key only if it matches GitHub's published fingerprint;
-4. prints the public key to add under **Repository → Settings → Deploy keys**;
-5. tests the connection.
-
-Clone using the alias:
-
-```bash
-git clone git@github-OWNER-REPO:OWNER/REPO.git
-```
-
 ---
 
 ## Daily operations
@@ -634,7 +504,7 @@ The health check reports:
 - CrowdSec bans and recent failed SSH logins;
 - Caddy status;
 - automatic update runs;
-- Tailscale status: connection, node key expiry and whether the exit node is advertised;
+- SSH port and whether UFW allows it;
 - whether a reboot is needed;
 - the Lynis score;
 - the provider firewall status.
@@ -688,29 +558,27 @@ Both scripts are safe to run again.
 
 - **`bootstrap.sh`:**
   - It asks before replacing an existing user's password and key, and backs up `authorized_keys` first.
-  - On a hardened server, it prints commands that use the Tailscale IP and SSH port.
+  - On a hardened server, it prints commands that use the server's address and SSH port.
   - It offers to add new admins to `AllowUsers`.
 - **`setup.sh`:**
-  - SSH port and firewall prompts: on a rerun, pressing Enter at the port prompt keeps the current port, and Tailscale isn't asked to log in again if it's already logged in. The provider firewall question isn't asked again once answered `done` or `skip`.
+  - SSH port prompt: on a rerun, pressing Enter keeps the current port. The provider firewall question isn't asked again once answered `done` or `skip`.
   - Existing admins stay in `AllowUsers`.
-  - Changing the SSH port closes the old port's firewall rule.
+  - Changing the SSH port closes the old firewall rule.
 
 **Servers set up by older versions:**
 - **Nginx:** Phase 2 disables Nginx and switches to Caddy, asking first if Nginx serves custom sites. The package and `/etc/nginx` are kept.
-- **Old shared GitHub key:** a leftover `~/.ssh/github` key is reported but not deleted.
 - **`ListenAddress` lines:** leftover lines from older versions are removed from `sshd_config`.
 
 ---
 
 ## Troubleshooting and recovery
 
-If you can't reach the server over Tailscale, log in through your **provider's emergency console** with the admin password, then run `sudo -i`.
+If you can't reach the server over SSH, log in through your **provider's emergency console** with the admin password. Then check the port with `sudo sshd -T | grep -i '^port'` and the firewall with `sudo ufw status`.
 
 | Problem | Fix |
 |---|---|
 | `Permission denied (publickey)` | Use `-i ~/keys/ADMIN-HOST.pem -o IdentitiesOnly=yes`. With several keys in your SSH agent, the server's limit of 3 attempts runs out before the right key |
 | `setlocale: cannot change locale` | Run `sudo localedef -i en_US -f UTF-8 en_US.UTF-8`, then log in again |
-| Tailscale logged out or key expired | Run `tailscale up --ssh --accept-dns=true --accept-routes=false`, open the link, then disable key expiry |
 | Banned by CrowdSec | Run `cscli decisions list`, then `cscli decisions delete --ip YOUR_IP` |
 | Firewall blocks you | Run `ufw disable`, fix the rules, then `ufw enable` |
 | Undo the last SSH change | Run `cp /etc/ssh/sshd_config.pre-run /etc/ssh/sshd_config && systemctl restart ssh`. The original distro config is in `sshd_config.bak` |
@@ -723,8 +591,7 @@ If you can't reach the server over Tailscale, log in through your **provider's e
 
 ## Security notes and limitations
 
-- **Your Tailscale login is as powerful as the SSH key**, because it grants Tailscale SSH access. Protect it with two-factor login on your Tailscale account.
-- **With an exit node, all your device traffic passes through the server**, so its provider sees it, its bandwidth carries it, and websites see its IP. Datacenter IP addresses are sometimes rate-limited or blocked.
+- **SSH is open to the internet**, protected by key-only login. Keep the key secret, use a passphrase, keep packages updated, and watch CrowdSec.
 - **The `docker` group is root-equivalent.** The admin user is a member, so anyone who can log in as that user can become root through Docker. Protect the SSH key with a passphrase, or remove the user from the group (`sudo gpasswd -d ADMIN docker`) and use `sudo docker`.
 - **Reboots are manual.** Kernel fixes only apply after a reboot.
 - **Not included:**
